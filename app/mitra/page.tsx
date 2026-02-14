@@ -25,6 +25,7 @@ interface Mitra {
   belanjaPusat: number;
   penjualanKonsumen: number;
   belanjaKotorAkumulasi: number;
+  valueProdukMitra: number; // Kolom baru untuk balance
   inventory: InventoryItem[];
 }
 interface RawMitra {
@@ -139,6 +140,15 @@ export default function MitraPage() {
       const rawR = (rRes.data as unknown as RawReport[]) || [];
       const rawI = (iRes.data as unknown as RawInvItem[]) || [];
 
+      // Mapping Rate Diskon
+      const rates: Record<string, number> = {
+        "Member": 0,
+        "Reseller": 0.15,
+        "Sub-Agen": 0.25,
+        "Agen": 0.35,
+        "Distributor": 0.45,
+      };
+
       const enriched: Mitra[] = rawM.map((m) => {
         const belanjaTunaiBulanIni = rawT
           .filter((t) => t.mitra_id === m.id)
@@ -152,8 +162,9 @@ export default function MitraPage() {
         const omzet = rawR
           .filter((r) => r.mitra_id === m.id)
           .reduce((a, c) => a + c.selling_price * c.qty, 0);
+
         const myInv = rawI.filter((inv) => inv.transactions?.mitra_id === m.id);
-        const totalKotorBulanIni = myInv
+        const totalBrutoBulanIni = myInv
           .filter(
             (inv) => inv.transactions && inv.transactions.created_at >= start,
           )
@@ -161,6 +172,10 @@ export default function MitraPage() {
             (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
             0,
           );
+
+        // Hitung Value Produk (Bruto - Diskon Tier)
+        const discountRate = rates[m.current_tier] || 0;
+        const valueBersihBulanIni = totalBrutoBulanIni * (1 - discountRate);
 
         const groupedStok = myInv.reduce(
           (acc: Record<string, { rem: number; tot: number }>, curr) => {
@@ -175,9 +190,10 @@ export default function MitraPage() {
 
         return {
           ...m,
-          belanjaPusat: belanjaTunaiBulanIni + pelunasanPiutangBulanIni,
+          belanjaPusat: belanjaTunaiBulanIni + pelunasanPiutangBulanIni, // NETTO KE PUSAT
           penjualanKonsumen: omzet,
-          belanjaKotorAkumulasi: totalKotorBulanIni,
+          belanjaKotorAkumulasi: totalBrutoBulanIni, // TOTAL BRUTO
+          valueProdukMitra: valueBersihBulanIni, // VALUE PRODUK MITRA
           inventory: Object.entries(groupedStok).map(([name, val]) => ({
             name,
             rem: val.rem,
@@ -284,7 +300,7 @@ export default function MitraPage() {
                 tier: isRP ? "Reseller" : form.tier,
               });
             }}
-            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none"
+            className="p-4 bg-gray-50 border rounded-2xl font-bold"
           >
             <option value="REGULER">Mitra Reguler</option>
             <option value="RP">Rumah Perubahan (VIP)</option>
@@ -292,7 +308,7 @@ export default function MitraPage() {
           <select
             value={form.tier}
             onChange={(e) => setForm({ ...form, tier: e.target.value })}
-            className={`p-4 border rounded-2xl font-bold outline-none focus:ring-2 ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-gray-50 border-gray-200"}`}
+            className={`p-4 border rounded-2xl font-bold outline-none ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-gray-50 border-gray-200"}`}
           >
             <option value="Member">Member</option>
             <option value="Reseller">Reseller</option>
@@ -304,7 +320,7 @@ export default function MitraPage() {
         <button
           className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs transition-all ${isEditing ? "bg-orange-500" : "bg-green-800"}`}
         >
-          {isEditing ? "Update Data Mitra" : "Daftarkan Sekarang"}
+          {isEditing ? "Update Data" : "Daftarkan Sekarang"}
         </button>
       </form>
 
@@ -313,12 +329,12 @@ export default function MitraPage() {
           placeholder="Cari nama mitra..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          className="md:col-span-2 p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+          className="md:col-span-2 p-4 bg-white border rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
         />
         <select
           value={tierFilter}
           onChange={(e) => setTierFilter(e.target.value)}
-          className="p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+          className="p-4 bg-white border rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
         >
           <option value="All">Semua Tier</option>
           <option value="Member">Member</option>
@@ -339,10 +355,13 @@ export default function MitraPage() {
               <th className="p-8 text-right bg-orange-50/20 border-r">
                 TOTAL BRUTO
               </th>
-              <th className="p-8 text-right bg-green-900/10 border-r">
+              <th className="p-8 text-right bg-blue-50/20 border-r text-blue-700">
+                VALUE PRODUK MITRA
+              </th>
+              <th className="p-8 text-right bg-green-900/10 border-r text-green-800">
                 NETTO KE PUSAT
               </th>
-              <th className="p-8 text-right bg-blue-50/10 border-r">OMZET</th>
+              <th className="p-8 text-right bg-purple-50/10 border-r">OMZET</th>
               <th className="p-8 text-center">AKSI</th>
             </tr>
           </thead>
@@ -361,7 +380,7 @@ export default function MitraPage() {
                       </span>
                     )}
                   </div>
-                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2 shadow-sm">
+                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2">
                     {m.current_tier}
                   </span>
                 </td>
@@ -385,12 +404,18 @@ export default function MitraPage() {
                 <td className="p-8 text-right font-mono font-black text-orange-600 italic text-lg border-r bg-orange-50/10">
                   Rp {m.belanjaKotorAkumulasi.toLocaleString("id-ID")}
                 </td>
+                <td className="p-8 text-right font-mono font-black text-blue-700 italic text-lg border-r bg-blue-50/10">
+                  Rp {m.valueProdukMitra.toLocaleString("id-ID")}
+                </td>
                 <td className="p-8 text-right font-mono font-black text-green-900 italic text-lg border-r bg-green-100/10">
                   Rp {m.belanjaPusat.toLocaleString("id-ID")}
                 </td>
-                <td className="p-8 text-right font-mono font-black text-blue-700 italic text-lg bg-blue-50/5 border-r">
+                <td className="p-8 text-right font-mono font-black text-purple-700 italic text-lg bg-purple-50/5 border-r">
                   Rp {m.penjualanKonsumen.toLocaleString("id-ID")}{" "}
-                  <TrendingUp size={16} className="inline text-blue-400 ml-1" />
+                  <TrendingUp
+                    size={16}
+                    className="inline text-purple-400 ml-1"
+                  />
                 </td>
                 <td className="p-8 text-center">
                   <div className="flex justify-center gap-4">
