@@ -1,8 +1,9 @@
 "use client";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation"; // Tambahkan useSearchParams
 import toast from "react-hot-toast";
+import { Calendar, History } from "lucide-react";
 
 interface Product {
   id: string;
@@ -21,6 +22,19 @@ type PaymentMethod = "QRIS" | "Transfer" | "Piutang";
 export default function TransaksiPage() {
   const supabase = useMemo(() => createClient(), []);
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // --- 1. LOGIKA PERIODE GLOBAL ---
+  const selectedMonth = useMemo(
+    () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
+    [searchParams],
+  );
+
+  const selectedYear = useMemo(
+    () => Number(searchParams.get("year")) || new Date().getFullYear(),
+    [searchParams],
+  );
+
   const [products, setProducts] = useState<Product[]>([]);
   const [mitra, setMitra] = useState<Mitra[]>([]);
   const [loading, setLoading] = useState(true);
@@ -30,16 +44,38 @@ export default function TransaksiPage() {
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("QRIS");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // --- 2. SINKRONISASI TANGGAL DEFAULT ---
+  // Kita set default tanggal ke tanggal 1 di bulan yang dipilih di Dashboard
+  const [transactionDate, setTransactionDate] = useState("");
+
+  useEffect(() => {
+    const monthStr = String(selectedMonth).padStart(2, "0");
+    // Jika bulan yang dipilih adalah bulan sekarang, pakai tanggal hari ini.
+    // Jika bukan, pakai tanggal 1 di bulan tersebut.
+    const today = new Date();
+    if (
+      selectedMonth === today.getMonth() + 1 &&
+      selectedYear === today.getFullYear()
+    ) {
+      setTransactionDate(today.toISOString().split("T")[0]);
+    } else {
+      setTransactionDate(`${selectedYear}-${monthStr}-01`);
+    }
+  }, [selectedMonth, selectedYear]);
+
   const fetchData = useCallback(async () => {
     try {
       const { data: p } = await supabase
         .from("products")
         .select("*")
+        .eq("is_active", true)
         .order("name");
+
       const { data: m } = await supabase
         .from("mitra")
         .select("*")
         .order("full_name");
+
       if (p) setProducts(p as Product[]);
       if (m) setMitra(m as Mitra[]);
     } finally {
@@ -55,6 +91,7 @@ export default function TransaksiPage() {
     e.preventDefault();
     if (!selectedMitra || !selectedProduct || qty < 1)
       return toast.error("Lengkapi data!");
+
     setIsSubmitting(true);
     const toastId = toast.loading("Memproses...");
 
@@ -103,6 +140,9 @@ export default function TransaksiPage() {
             paid_amount: Math.round(isPiutang ? 0 : netAmount),
             payment_method: paymentMethod,
             payment_status: isPiutang ? "Unpaid" : "Paid",
+            created_at: new Date(
+              `${transactionDate}T${new Date().toTimeString().split(" ")[0]}`,
+            ).toISOString(),
           },
         ])
         .select()
@@ -130,7 +170,9 @@ export default function TransaksiPage() {
       });
       router.refresh();
       await fetchData();
-      window.location.reload();
+      setSelectedMitra("");
+      setSelectedProduct("");
+      setQty(1);
     } catch {
       toast.error("Transaksi gagal!", { id: toastId });
     } finally {
@@ -145,15 +187,57 @@ export default function TransaksiPage() {
       </div>
     );
 
+  const months = [
+    "Januari",
+    "Februari",
+    "Maret",
+    "April",
+    "Mei",
+    "Juni",
+    "Juli",
+    "Agustus",
+    "September",
+    "Oktober",
+    "November",
+    "Desember",
+  ];
+
   return (
     <div className="p-8 max-w-2xl mx-auto font-sans text-gray-900">
-      <h1 className="text-3xl font-black text-green-900 italic uppercase mb-8 text-center tracking-tighter">
-        Input Penjualan Pusat
-      </h1>
+      <header className="mb-8 text-center">
+        <h1 className="text-3xl font-black text-green-900 italic uppercase tracking-tighter">
+          Input Pemesanan Mitra
+        </h1>
+        {/* Indikator agar admin tidak salah input bulan */}
+        <div className="mt-2 flex justify-center">
+          <div className="bg-orange-50 px-4 py-1.5 rounded-full border border-orange-100 flex items-center gap-2">
+            <History size={12} className="text-orange-600" />
+            <span className="text-[9px] font-black uppercase text-orange-600 tracking-widest">
+              Mode Input: {months[selectedMonth - 1]} {selectedYear}
+            </span>
+          </div>
+        </div>
+      </header>
+
       <form
         onSubmit={handleSubmit}
         className="bg-white p-10 rounded-[40px] shadow-2xl border border-gray-100 space-y-6"
       >
+        <div className="bg-orange-50/50 p-4 rounded-2xl border border-orange-100 mb-4">
+          <label className="text-[10px] font-black uppercase text-orange-600 mb-2 tracking-widest ml-1 flex items-center gap-2">
+            <Calendar size={12} /> Tanggal Transaksi
+          </label>
+          <input
+            type="date"
+            value={transactionDate}
+            onChange={(e) => setTransactionDate(e.target.value)}
+            // Membatasi input agar hanya bisa di bulan yang dipilih
+            min={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-01`}
+            max={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-${new Date(selectedYear, selectedMonth, 0).getDate()}`}
+            className="w-full p-3 bg-white border border-orange-200 rounded-xl font-bold text-orange-900 outline-none focus:ring-2 focus:ring-orange-500 cursor-pointer"
+          />
+        </div>
+
         <div>
           <label className="text-[10px] font-black uppercase text-gray-500 mb-2 tracking-widest ml-1">
             Nama Mitra
@@ -171,6 +255,7 @@ export default function TransaksiPage() {
             ))}
           </select>
         </div>
+
         <div className="grid grid-cols-2 gap-6">
           <div>
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 tracking-widest ml-1">
@@ -202,6 +287,7 @@ export default function TransaksiPage() {
             />
           </div>
         </div>
+
         <div className="flex gap-4 justify-center bg-gray-50/50 p-4 rounded-2xl border border-dashed border-gray-200">
           {(["QRIS", "Transfer", "Piutang"] as PaymentMethod[]).map((m) => (
             <label
@@ -224,6 +310,7 @@ export default function TransaksiPage() {
             </label>
           ))}
         </div>
+
         <button
           type="submit"
           disabled={isSubmitting}

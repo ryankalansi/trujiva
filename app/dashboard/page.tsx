@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
+import { useRouter, useSearchParams } from "next/navigation";
 import * as XLSX from "xlsx";
 import {
   Wallet,
@@ -11,6 +12,8 @@ import {
   FileBarChart,
   BarChart3,
   CalendarDays,
+  Filter,
+  Gift,
 } from "lucide-react";
 
 // --- Interface Definisi Data ---
@@ -20,6 +23,7 @@ interface DashboardStats {
   piutangMitra: number;
   omzetKonsumen: number;
   totalMitra: number;
+  biayaSample: number;
 }
 interface ProductAudit {
   name: string;
@@ -31,14 +35,17 @@ interface ProductAudit {
 interface TransactionItemJoin {
   qty: number;
   remaining_qty_at_partner: number;
+  product_id: string;
   product: { name: string; base_price: number } | null;
   transactions: {
+    id: string;
     mitra: { id: string; full_name: string; current_tier: string } | null;
     payment_method: string;
     payment_status: string;
     paid_amount: number;
     total_amount: number;
     created_at: string;
+    is_sample: boolean;
   } | null;
 }
 interface PartnerReportJoin {
@@ -57,34 +64,37 @@ interface StatCardProps {
   isCurrency?: boolean;
 }
 
-// Interface Excel yang Fleksibel (Mendukung NO sebagai string "" untuk baris total)
 interface ExcelKasRow {
   "NO": number | string;
+  "TANGGAL": string;
   "MITRA": string;
   "STATUS": string;
   "DIBAYAR KE PUSAT": string;
   "SISA PIUTANG": string;
 }
 
-interface ExcelIndividualRow {
-  "NO": number | string;
-  "TANGGAL": string;
-  "PRODUK": string;
-  "QTY DIAMBIL": number | string;
-  "STOK DI TANGAN": number | string;
-  "OMZET PENJUALAN": string;
-  "MODAL KE PUSAT": string;
-  "PIUTANG": string;
-}
-
 export default function ExecutiveDashboard() {
   const supabase = useMemo(() => createClient(), []);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const selectedMonth = useMemo(
+    () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
+    [searchParams],
+  );
+
+  const selectedYear = useMemo(
+    () => Number(searchParams.get("year")) || new Date().getFullYear(),
+    [searchParams],
+  );
+
   const [stats, setStats] = useState<DashboardStats>({
     omzetKotor: 0,
     dibayarKePusat: 0,
     piutangMitra: 0,
     omzetKonsumen: 0,
     totalMitra: 0,
+    biayaSample: 0,
   });
   const [auditStok, setAuditStok] = useState<ProductAudit[]>([]);
   const [loading, setLoading] = useState(true);
@@ -95,189 +105,231 @@ export default function ExecutiveDashboard() {
     PartnerReportJoin[]
   >([]);
 
-  const currentMonthName = new Intl.DateTimeFormat("id-ID", {
-    month: "long",
-    year: "numeric",
-  }).format(new Date());
+  const months = [
+    "Januari",
+    "Februari",
+    "Maret",
+    "April",
+    "Mei",
+    "Juni",
+    "Juli",
+    "Agustus",
+    "September",
+    "Oktober",
+    "November",
+    "Desember",
+  ];
+  const years = [2026];
+
+  const updateURL = (month: number, year: number) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("month", month.toString());
+    params.set("year", year.toString());
+    router.push(`${window.location.pathname}?${params.toString()}`);
+  };
+
+  const fetchDashboardData = useCallback(async () => {
+    setLoading(true);
+    const startOfMonth = new Date(
+      selectedYear,
+      selectedMonth - 1,
+      1,
+      0,
+      0,
+      0,
+      0,
+    ).toISOString();
+    const endOfMonth = new Date(
+      selectedYear,
+      selectedMonth,
+      0,
+      23,
+      59,
+      59,
+      999,
+    ).toISOString();
+
+    const [reportsRes, prodsRes, itemsRes, mitraRes] = await Promise.all([
+      supabase
+        .from("partner_reports")
+        .select(
+          "qty, selling_price, mitra_id, created_at, product:product_id(name)",
+        )
+        .gte("created_at", startOfMonth)
+        .lte("created_at", endOfMonth),
+      supabase.from("products").select("*"),
+      supabase
+        .from("transaction_items")
+        .select(
+          `
+          qty, product_id, remaining_qty_at_partner, 
+          product:product_id(name, base_price), 
+          transactions!inner(id, created_at, payment_method, payment_status, paid_amount, total_amount, is_sample, mitra:mitra_id(id, full_name, current_tier))
+        `,
+        )
+        .gte("transactions.created_at", startOfMonth)
+        .lte("transactions.created_at", endOfMonth),
+      supabase.from("mitra").select("id", { count: "exact", head: true }),
+    ]);
+
+    if (prodsRes.data && reportsRes.data && itemsRes.data) {
+      const items = itemsRes.data as unknown as TransactionItemJoin[];
+      const reports = reportsRes.data as unknown as PartnerReportJoin[];
+      setRawPartnerReports(reports);
+      setRawTransactionItems(items);
+
+      const totalPaid = items
+        .filter((i) => !i.transactions?.is_sample)
+        .reduce((a, c) => a + (c.transactions?.paid_amount || 0), 0);
+      const totalUnpaid = items
+        .filter((i) => !i.transactions?.is_sample)
+        .reduce((a, c) => a + (c.transactions?.total_amount || 0), 0);
+      const totalOmzetMitra = reports.reduce(
+        (a, c) => a + c.selling_price * c.qty,
+        0,
+      );
+      const costSample = items
+        .filter((i) => i.transactions?.is_sample)
+        .reduce(
+          (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
+          0,
+        );
+      const totalBruto = items
+        .filter((i) => !i.transactions?.is_sample)
+        .reduce(
+          (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
+          0,
+        );
+
+      setStats({
+        omzetKotor: totalBruto,
+        dibayarKePusat: totalPaid,
+        piutangMitra: totalUnpaid,
+        omzetKonsumen: totalOmzetMitra,
+        totalMitra: mitraRes.count || 0,
+        biayaSample: costSample,
+      });
+
+      setAuditStok(
+        prodsRes.data.map((p) => {
+          const keluarPeriodeIni = items
+            .filter((item) => item.product_id === p.id)
+            .reduce((acc, curr) => acc + curr.qty, 0);
+          return {
+            name: p.is_active ? p.name : `${p.name} (OFF)`,
+            stokAwal: p.stock + keluarPeriodeIni,
+            barangKeluar: keluarPeriodeIni,
+            sisaStok: p.stock,
+            status: p.stock < 10 ? "KRITIS" : p.stock < 50 ? "MENIPIS" : "AMAN",
+          };
+        }),
+      );
+    }
+    setLoading(false);
+  }, [supabase, selectedMonth, selectedYear]);
 
   useEffect(() => {
-    async function fetchDashboardData() {
-      const now = new Date();
-      const firstDay = new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        1,
-      ).toISOString();
-      const lastDay = new Date(
-        now.getFullYear(),
-        now.getMonth() + 1,
-        0,
-        23,
-        59,
-        59,
-      ).toISOString();
-
-      const [transRes, reportsRes, prodsRes, itemsRes, mitraRes] =
-        await Promise.all([
-          supabase
-            .from("transactions")
-            .select("total_amount, paid_amount")
-            .gte("created_at", firstDay)
-            .lte("created_at", lastDay),
-          supabase
-            .from("partner_reports")
-            .select(
-              "qty, selling_price, mitra_id, created_at, product:product_id(name)",
-            )
-            .gte("created_at", firstDay)
-            .lte("created_at", lastDay),
-          supabase.from("products").select("*"),
-          supabase
-            .from("transaction_items")
-            .select(
-              `
-          qty, remaining_qty_at_partner, product:product_id(name, base_price), 
-          transactions:transaction_id(created_at, payment_method, payment_status, paid_amount, total_amount, mitra:mitra_id(id, full_name, current_tier))
-        `,
-            )
-            .gte("transactions.created_at", firstDay)
-            .lte("transactions.created_at", lastDay),
-          supabase.from("mitra").select("id", { count: "exact", head: true }),
-        ]);
-
-      if (transRes.data && prodsRes.data && reportsRes.data && itemsRes.data) {
-        const items = itemsRes.data as unknown as TransactionItemJoin[];
-        const reports = reportsRes.data as unknown as PartnerReportJoin[];
-        setRawPartnerReports(reports);
-        setRawTransactionItems(items);
-
-        const totalPaid = transRes.data.reduce(
-          (a, c) => a + (Number(c.paid_amount) || 0),
-          0,
-        );
-        const totalUnpaid = transRes.data.reduce(
-          (a, c) => a + (Number(c.total_amount) || 0),
-          0,
-        );
-        const totalOmzet = reports.reduce(
-          (a, c) => a + c.selling_price * c.qty,
-          0,
-        );
-
-        setStats({
-          omzetKotor: items.reduce(
-            (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
-            0,
-          ),
-          dibayarKePusat: totalPaid,
-          piutangMitra: totalUnpaid,
-          omzetKonsumen: totalOmzet,
-          totalMitra: mitraRes.count || 0,
-        });
-
-        setAuditStok(
-          prodsRes.data.map((p) => ({
-            name: p.name,
-            stokAwal: p.initial_stock,
-            barangKeluar: p.initial_stock - p.stock,
-            sisaStok: p.stock,
-            status: p.stock < 50 ? "MENIPIS" : "AMAN",
-          })),
-        );
+    let isMounted = true;
+    (async () => {
+      if (isMounted) {
+        await fetchDashboardData();
       }
-      setLoading(false);
-    }
-    fetchDashboardData();
-  }, [supabase]);
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, [fetchDashboardData]);
 
   const toIDR = (num: number) => `Rp ${num.toLocaleString("id-ID")}`;
 
   const downloadMasterReport = () => {
     if (rawTransactionItems.length === 0)
-      return alert("Data bulan ini masih kosong!");
+      return alert("Data periode ini masih kosong!");
     const wb = XLSX.utils.book_new();
 
-    // 1. SHEET: RINGKASAN KAS
-    const summaryPaid = rawTransactionItems.reduce(
-      (a, c) => a + (c.transactions?.paid_amount || 0),
-      0,
+    // --- SHEET 1: RINGKASAN ARUS KAS ---
+    const activeItems = rawTransactionItems.filter(
+      (i) => !i.transactions?.is_sample,
     );
-    const summaryUnpaid = rawTransactionItems.reduce(
-      (a, c) => a + (c.transactions?.total_amount || 0),
-      0,
-    );
-
-    const dataArusKas: ExcelKasRow[] = rawTransactionItems.map((item, idx) => ({
+    const dataKas: ExcelKasRow[] = activeItems.map((item, idx) => ({
       "NO": idx + 1,
+      "TANGGAL": new Date(
+        item.transactions?.created_at || "",
+      ).toLocaleDateString("id-ID"),
       "MITRA": item.transactions?.mitra?.full_name || "N/A",
       "STATUS": item.transactions?.payment_status || "N/A",
       "DIBAYAR KE PUSAT": toIDR(item.transactions?.paid_amount || 0),
       "SISA PIUTANG": toIDR(item.transactions?.total_amount || 0),
     }));
 
-    dataArusKas.push({
+    dataKas.push({
       "NO": "",
-      "MITRA": "TOTAL AKUMULASI",
+      "TANGGAL": "TOTAL AKUMULASI",
+      "MITRA": "",
       "STATUS": "",
-      "DIBAYAR KE PUSAT": toIDR(summaryPaid),
-      "SISA PIUTANG": toIDR(summaryUnpaid),
+      "DIBAYAR KE PUSAT": toIDR(stats.dibayarKePusat),
+      "SISA PIUTANG": toIDR(stats.piutangMitra),
     });
     XLSX.utils.book_append_sheet(
       wb,
-      XLSX.utils.json_to_sheet(dataArusKas),
-      "1. Ringkasan Kas",
+      XLSX.utils.json_to_sheet(dataKas),
+      "1. Arus Kas",
     );
 
-    // 2. SHEET: DATA MITRA & KOMISI
-    const uniqueIds = Array.from(
-      new Set(rawTransactionItems.map((i) => i.transactions?.mitra?.id)),
+    // --- SHEET 2: AUDIT STOK ---
+    const dataAudit = auditStok.map((item) => ({
+      "PRODUK": item.name,
+      "STOK AWAL PERIODE": item.stokAwal,
+      "BARANG KELUAR": item.barangKeluar,
+      "SISA STOK GUDANG": item.sisaStok,
+      "STATUS": item.status,
+    }));
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(dataAudit),
+      "2. Audit Stok",
     );
-    const commissionRates: Record<string, string> = {
+
+    // --- SHEET 3: DATA MITRA & KOMISI ---
+    const uniqueMitraIds = Array.from(
+      new Set(activeItems.map((i) => i.transactions?.mitra?.id)),
+    );
+    const commissionMap: Record<string, string> = {
       "Member": "0%",
       "Reseller": "15%",
       "Sub-Agen": "25%",
       "Agen": "35%",
       "Distributor": "45%",
     };
-    const dataMitra = uniqueIds.map((id, idx) => {
-      const m = rawTransactionItems.find(
-        (i) => i.transactions?.mitra?.id === id,
-      )?.transactions?.mitra;
+    const dataMitra = uniqueMitraIds.map((id, idx) => {
+      const m = activeItems.find((i) => i.transactions?.mitra?.id === id)
+        ?.transactions?.mitra;
       return {
         "NO": idx + 1,
-        "NAMA MITRA": m?.full_name || "Unknown",
-        "TIER LEVEL": m?.current_tier || "Member",
-        "DISKON KOMISI": commissionRates[m?.current_tier || "Member"] || "0%",
+        "NAMA MITRA": m?.full_name || "N/A",
+        "TIER LEVEL": m?.current_tier || "N/A",
+        "DISKON KOMISI": commissionMap[m?.current_tier || ""] || "0%",
       };
     });
     XLSX.utils.book_append_sheet(
       wb,
       XLSX.utils.json_to_sheet(dataMitra),
-      "2. Data Mitra & Komisi",
+      "3. Data Mitra",
     );
 
-    // 3. SHEET INDIVIDUAL PER MITRA
-    uniqueIds.forEach((mId) => {
+    // --- SHEET 4: INDIVIDUAL MITRA ---
+    uniqueMitraIds.forEach((mId) => {
       if (!mId) return;
-      const mTrans = rawTransactionItems.filter(
+      const mTrans = activeItems.filter(
         (i) => i.transactions?.mitra?.id === mId,
       );
       const mReports = rawPartnerReports.filter((r) => r.mitra_id === mId);
       const mName = mTrans[0].transactions?.mitra?.full_name || "Unknown";
 
-      let tModal = 0;
-      let tPiutang = 0;
-      let tOmzet = 0;
-
-      const detailRows: ExcelIndividualRow[] = mTrans.map((f, i) => {
+      const detailRows = mTrans.map((f, i) => {
         const report = mReports.find(
           (r) => r.product?.name === f.product?.name,
         );
-        const omzet = report ? report.qty * report.selling_price : 0;
-        tModal += f.transactions?.paid_amount || 0;
-        tPiutang += f.transactions?.total_amount || 0;
-        tOmzet += omzet;
-
         return {
           "NO": i + 1,
           "TANGGAL": new Date(
@@ -286,53 +338,55 @@ export default function ExecutiveDashboard() {
           "PRODUK": f.product?.name || "N/A",
           "QTY DIAMBIL": f.qty,
           "STOK DI TANGAN": f.remaining_qty_at_partner,
-          "OMZET PENJUALAN": toIDR(omzet),
+          "OMZET PENJUALAN": toIDR(
+            report ? report.qty * report.selling_price : 0,
+          ),
           "MODAL KE PUSAT": toIDR(f.transactions?.paid_amount || 0),
           "PIUTANG": toIDR(f.transactions?.total_amount || 0),
         };
       });
-
-      detailRows.push({
-        "NO": "",
-        "TANGGAL": "TOTAL",
-        "PRODUK": "",
-        "QTY DIAMBIL": "",
-        "STOK DI TANGAN": "",
-        "OMZET PENJUALAN": toIDR(tOmzet),
-        "MODAL KE PUSAT": toIDR(tModal),
-        "PIUTANG": toIDR(tPiutang),
-      });
-
       XLSX.utils.book_append_sheet(
         wb,
         XLSX.utils.json_to_sheet(detailRows),
-        `Mitra - ${mName}`.substring(0, 31),
+        `${mName}`.substring(0, 31),
       );
     });
 
-    // 4. SHEET: AUDIT STOK GUDANG
+    // --- SHEET 5: RIWAYAT SAMPLE ---
+    const sampleItems = rawTransactionItems.filter(
+      (i) => i.transactions?.is_sample,
+    );
+    const dataSample = sampleItems.map((item, idx) => ({
+      "NO": idx + 1,
+      "TANGGAL": new Date(
+        item.transactions?.created_at || "",
+      ).toLocaleDateString("id-ID"),
+      "PRODUK": item.product?.name || "N/A",
+      "QTY": item.qty,
+      "ESTIMASI VALUE": toIDR(item.qty * (item.product?.base_price || 0)),
+    }));
     XLSX.utils.book_append_sheet(
       wb,
-      XLSX.utils.json_to_sheet(auditStok),
-      "Audit Stok Gudang",
+      XLSX.utils.json_to_sheet(dataSample),
+      "5. Riwayat Sample",
     );
 
     XLSX.writeFile(
       wb,
-      `TRUJIVA_REPORT_${currentMonthName.replace(" ", "_")}.xlsx`,
+      `TRUJIVA_MASTER_REPORT_${months[selectedMonth - 1]}_${selectedYear}.xlsx`,
     );
   };
 
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sinkronisasi Dashboard...
+        Syncing Dashboard {months[selectedMonth - 1]}...
       </div>
     );
 
   return (
     <div className="p-8 max-w-7xl mx-auto font-sans text-gray-900">
-      <header className="mb-10 flex justify-between items-center">
+      <header className="mb-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
         <div>
           <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
             Executive Dashboard
@@ -340,19 +394,54 @@ export default function ExecutiveDashboard() {
           <div className="flex items-center gap-2 text-orange-600 mt-1">
             <CalendarDays size={16} />
             <p className="text-[10px] font-black uppercase tracking-widest">
-              Periode: {currentMonthName}
+              Periode Aktif: {months[selectedMonth - 1]} {selectedYear}
             </p>
           </div>
         </div>
-        <button
-          onClick={downloadMasterReport}
-          className="bg-green-900 text-white px-6 py-3 rounded-2xl font-black text-xs uppercase flex items-center gap-2 shadow-xl hover:scale-105 transition-all"
-        >
-          <FileBarChart size={18} /> Master Report (Excel)
-        </button>
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2 bg-white px-4 py-2 rounded-2xl shadow-sm border border-gray-100">
+            <Filter size={14} className="text-green-800" />
+            <select
+              value={selectedMonth}
+              onChange={(e) => updateURL(Number(e.target.value), selectedYear)}
+              className="text-xs font-black uppercase outline-none bg-transparent cursor-pointer"
+            >
+              {months.map((m, i) => {
+                const monthIndex = i + 1;
+                if (
+                  monthIndex > new Date().getMonth() + 1 &&
+                  selectedYear === new Date().getFullYear()
+                )
+                  return null;
+                return (
+                  <option key={m} value={monthIndex}>
+                    {m}
+                  </option>
+                );
+              })}
+            </select>
+            <select
+              value={selectedYear}
+              onChange={(e) => updateURL(selectedMonth, Number(e.target.value))}
+              className="text-xs font-black uppercase outline-none bg-transparent cursor-pointer"
+            >
+              {years.map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            onClick={downloadMasterReport}
+            className="bg-green-900 text-white px-6 py-3 rounded-2xl font-black text-xs uppercase flex items-center gap-2 shadow-xl hover:scale-105 transition-all"
+          >
+            <FileBarChart size={18} /> Master Report (Excel)
+          </button>
+        </div>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-12">
+      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-12">
         <StatCard
           title="Bruto Keluar"
           value={stats.omzetKotor}
@@ -379,6 +468,12 @@ export default function ExecutiveDashboard() {
           color="bg-purple-50"
         />
         <StatCard
+          title="Biaya Sample"
+          value={stats.biayaSample}
+          icon={<Gift className="text-blue-500" />}
+          color="bg-blue-50"
+        />
+        <StatCard
           title="Total Mitra"
           value={stats.totalMitra}
           icon={<Users className="text-gray-500" />}
@@ -388,18 +483,21 @@ export default function ExecutiveDashboard() {
       </div>
 
       <div className="bg-white rounded-[40px] shadow-2xl border border-gray-100 overflow-hidden">
-        <div className="p-8 border-b border-gray-50 bg-gray-50/30">
+        <div className="p-8 border-b border-gray-50 bg-gray-50/30 flex justify-between items-center">
           <h2 className="text-xl font-black text-green-900 italic uppercase flex items-center gap-2">
             <Package size={24} /> Audit Stok Gudang
           </h2>
+          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">
+            Update Real-time
+          </span>
         </div>
         <div className="p-8 overflow-x-auto">
           <table className="w-full text-left">
             <thead>
               <tr className="text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
                 <th className="pb-6">Produk</th>
-                <th className="pb-6">Stok Awal</th>
-                <th className="pb-6 text-red-500">Barang Keluar</th>
+                <th className="pb-6">Est. Stok Awal</th>
+                <th className="pb-6 text-red-500">Keluar Bln Ini</th>
                 <th className="pb-6 text-green-700">Sisa Stok</th>
                 <th className="pb-6 text-center">Status</th>
               </tr>

@@ -1,13 +1,14 @@
 "use client";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
+import { useSearchParams } from "next/navigation";
+import toast from "react-hot-toast";
 import {
   Search,
   Filter,
   History as HistoryIcon,
-  ChevronLeft,
-  ChevronRight,
-  Wallet,
+  CalendarDays,
+  Trash2,
 } from "lucide-react";
 
 interface Transaction {
@@ -17,9 +18,11 @@ interface Transaction {
   paid_amount: number;
   payment_status: string;
   payment_method: string;
+  mitra_id: string;
   mitra: { full_name: string; current_tier: string } | null;
   transaction_items: {
     qty: number;
+    product_id: string;
     remaining_qty_at_partner: number;
     product: { name: string } | null;
   }[];
@@ -27,64 +30,172 @@ interface Transaction {
 
 export default function ArusKasPusatPage() {
   const supabase = useMemo(() => createClient(), []);
+  const searchParams = useSearchParams();
+
+  const selectedMonth = useMemo(
+    () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
+    [searchParams],
+  );
+
+  const selectedYear = useMemo(
+    () => Number(searchParams.get("year")) || new Date().getFullYear(),
+    [searchParams],
+  );
+
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
-  const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
+
+  const months = [
+    "Januari",
+    "Februari",
+    "Maret",
+    "April",
+    "Mei",
+    "Juni",
+    "Juli",
+    "Agustus",
+    "September",
+    "Oktober",
+    "November",
+    "Desember",
+  ];
+
+  const loadHistory = useCallback(async () => {
+    setLoading(true);
+    const startOfMonth = new Date(
+      selectedYear,
+      selectedMonth - 1,
+      1,
+      0,
+      0,
+      0,
+      0,
+    ).toISOString();
+    const endOfMonth = new Date(
+      selectedYear,
+      selectedMonth,
+      0,
+      23,
+      59,
+      59,
+      999,
+    ).toISOString();
+
+    const { data } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id, created_at, total_amount, paid_amount, payment_status, payment_method, mitra_id,
+        mitra:mitra_id (full_name, current_tier),
+        transaction_items (qty, product_id, remaining_qty_at_partner, product:product_id (name))
+      `,
+      )
+      .eq("is_sample", false)
+      .gte("created_at", startOfMonth)
+      .lte("created_at", endOfMonth)
+      .order("created_at", { ascending: false });
+
+    if (data) setTransactions(data as unknown as Transaction[]);
+    setLoading(false);
+  }, [supabase, selectedMonth, selectedYear]);
 
   useEffect(() => {
-    async function loadHistory() {
-      const { data } = await supabase
-        .from("transactions")
-        .select(
-          `
-        id, created_at, total_amount, paid_amount, payment_status, payment_method,
-        mitra:mitra_id (full_name, current_tier),
-        transaction_items (qty, remaining_qty_at_partner, product:product_id (name))
-      `,
-        )
-        .order("created_at", { ascending: false });
+    let isMounted = true;
+    (async () => {
+      if (isMounted) await loadHistory();
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, [loadHistory]);
 
-      if (data) setTransactions(data as unknown as Transaction[]);
-      setLoading(false);
+  const handleDelete = async (id: string) => {
+    if (
+      !confirm("Hapus transaksi ini? Stok gudang akan otomatis dikembalikan.")
+    )
+      return;
+
+    const toastId = toast.loading("Mengembalikan stok & menghapus data...");
+
+    try {
+      // 1. Ambil data item transaksi untuk proses restore stok
+      const { data: items, error: fetchError } = await supabase
+        .from("transaction_items")
+        .select("qty, product_id")
+        .eq("transaction_id", id);
+
+      if (fetchError) throw fetchError;
+
+      // 2. Kembalikan stok ke tabel products
+      if (items && items.length > 0) {
+        for (const item of items) {
+          const { data: productData } = await supabase
+            .from("products")
+            .select("stock")
+            .eq("id", item.product_id)
+            .single();
+
+          if (productData) {
+            await supabase
+              .from("products")
+              .update({ stock: productData.stock + item.qty })
+              .eq("id", item.product_id);
+          }
+        }
+      }
+
+      // 3. Hapus transaksi utama (Cascade delete akan hapus transaction_items otomatis)
+      const { error: deleteError } = await supabase
+        .from("transactions")
+        .delete()
+        .eq("id", id);
+
+      if (deleteError) throw deleteError;
+
+      toast.success("Berhasil! Stok kembali & transaksi dihapus.", {
+        id: toastId,
+      });
+      loadHistory();
+    } catch (err) {
+      console.error(err);
+      toast.error("Gagal sinkronisasi data!", { id: toastId });
     }
-    loadHistory();
-  }, [supabase]); // Dependensi hanya supabase agar jalan sekali saat mount
+  };
 
   const filteredData = useMemo(() => {
     return transactions.filter((t) => {
-      const matchSearch = t.mitra?.full_name
-        .toLowerCase()
-        .includes(searchTerm.toLowerCase());
+      const name = t.mitra?.full_name || "";
+      const matchSearch = name.toLowerCase().includes(searchTerm.toLowerCase());
       const matchStatus =
         statusFilter === "All" || t.payment_status === statusFilter;
       return matchSearch && matchStatus;
     });
   }, [transactions, searchTerm, statusFilter]);
 
-  const totalPages = Math.ceil(filteredData.length / itemsPerPage);
-  const indexOfFirstItem = (currentPage - 1) * itemsPerPage;
-  const currentItems = filteredData.slice(
-    indexOfFirstItem,
-    indexOfFirstItem + itemsPerPage,
-  );
-
   if (loading)
     return (
       <div className="p-8 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sync Arus Kas...
+        Sync Arus Kas {months[selectedMonth - 1]}...
       </div>
     );
 
   return (
     <div className="p-8 max-w-7xl mx-auto font-sans text-gray-900">
-      <header className="mb-10 flex items-center gap-3">
-        <HistoryIcon size={36} className="text-green-900" />
-        <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
-          Arus Kas & Stok Mitra
-        </h1>
+      <header className="mb-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div className="flex items-center gap-3">
+          <HistoryIcon size={36} className="text-green-900" />
+          <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
+            Arus Kas & Stok Mitra
+          </h1>
+        </div>
+        <div className="bg-blue-50 px-4 py-2 rounded-2xl border border-blue-100 flex items-center gap-2">
+          <CalendarDays size={16} className="text-blue-600" />
+          <span className="text-[10px] font-black uppercase text-blue-600 tracking-widest">
+            Periode: {months[selectedMonth - 1]} {selectedYear}
+          </span>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -97,10 +208,7 @@ export default function ArusKasPusatPage() {
             type="text"
             placeholder="Cari nama mitra..."
             value={searchTerm}
-            onChange={(e) => {
-              setSearchTerm(e.target.value);
-              setCurrentPage(1);
-            }}
+            onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm outline-none focus:ring-2 focus:ring-green-500 font-bold"
           />
         </div>
@@ -111,11 +219,8 @@ export default function ArusKasPusatPage() {
           />
           <select
             value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value);
-              setCurrentPage(1);
-            }}
-            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold appearance-none cursor-pointer outline-none focus:ring-2 focus:ring-green-500"
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none cursor-pointer focus:ring-2 focus:ring-green-500 appearance-none"
           >
             <option value="All">Semua Status</option>
             <option value="Unpaid">Piutang</option>
@@ -128,92 +233,87 @@ export default function ArusKasPusatPage() {
         <table className="w-full text-left">
           <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
             <tr>
-              <th className="p-8 border-r text-center w-16 font-black uppercase">
+              <th className="p-8 border-r text-center w-16 font-black uppercase tracking-widest">
                 No
               </th>
-              <th className="p-8">Mitra & Metode</th>
+              <th className="p-8">Waktu & Mitra</th>
               <th className="p-8">Stok Aktif</th>
               <th className="p-8 text-right bg-green-50/20 border-r">
-                Dibayar ke Pusat
+                Dibayar
               </th>
-              <th className="p-8 text-right bg-red-50/10">Sisa Piutang</th>
-              <th className="p-8 text-center">Status</th>
+              <th className="p-8 text-right bg-red-50/10">Piutang</th>
+              <th className="p-8 text-center">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-50">
-            {currentItems.map((t, idx) => (
-              <tr
-                key={t.id}
-                className="hover:bg-green-50/10 transition-all cursor-default group"
-              >
-                <td className="p-8 text-center font-bold text-gray-300 border-r">
-                  {indexOfFirstItem + idx + 1}
-                </td>
-                <td className="p-8">
-                  <div className="font-bold text-gray-800 uppercase">
-                    {t.mitra?.full_name}
-                  </div>
-                  <div className="flex gap-2 mt-2 items-center">
-                    <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg">
-                      {t.mitra?.current_tier}
-                    </span>
-                    <span className="text-[9px] font-black uppercase bg-green-50 text-green-700 px-2 py-0.5 rounded-lg border border-green-100 flex items-center gap-1">
-                      <Wallet size={10} /> {t.payment_method}
-                    </span>
-                  </div>
-                </td>
-                <td className="p-8">
-                  {t.transaction_items.map((item, i) => (
-                    <div
-                      key={i}
-                      className="text-[10px] font-black text-gray-500 uppercase italic mb-1"
-                    >
-                      {item.product?.name}: {item.remaining_qty_at_partner} Pcs
+            {filteredData.length > 0 ? (
+              filteredData.map((t, idx) => (
+                <tr key={t.id} className="hover:bg-green-50/10 transition-all">
+                  <td className="p-8 text-center font-bold text-gray-300 border-r">
+                    {idx + 1}
+                  </td>
+                  <td className="p-8">
+                    <div className="text-[10px] font-bold text-gray-300 mb-1">
+                      {new Date(t.created_at).toLocaleDateString("id-ID")}
                     </div>
-                  ))}
-                </td>
-                <td className="p-8 text-right border-r bg-green-50/20 font-mono font-black text-green-700 italic text-lg">
-                  Rp {t.paid_amount.toLocaleString("id-ID")}
-                </td>
-                <td className="p-8 text-right bg-red-50/10 font-mono font-black text-red-600 italic text-lg">
-                  Rp {t.total_amount.toLocaleString("id-ID")}
-                </td>
-                <td className="p-8 text-center">
-                  <span
-                    className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase ${t.payment_status === "Paid" ? "bg-green-700 text-white" : "bg-red-50 text-red-500 border border-red-100"}`}
-                  >
-                    {t.payment_status}
-                  </span>
+                    <div className="font-bold text-gray-800 uppercase">
+                      {t.mitra?.full_name}
+                    </div>
+                    <div className="flex gap-2 mt-2 items-center">
+                      <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg">
+                        {t.mitra?.current_tier}
+                      </span>
+                      <span className="text-[9px] font-black uppercase bg-green-50 text-green-700 px-2 py-0.5 rounded-lg border border-green-100 tracking-tighter px-2 whitespace-nowrap">
+                        {t.payment_method}
+                      </span>
+                    </div>
+                  </td>
+                  <td className="p-8">
+                    {t.transaction_items.map((item, i) => (
+                      <div
+                        key={i}
+                        className="text-[10px] font-black text-gray-500 uppercase italic mb-1"
+                      >
+                        {item.product?.name}: {item.remaining_qty_at_partner}{" "}
+                        Pcs
+                      </div>
+                    ))}
+                  </td>
+                  <td className="p-8 text-right border-r bg-green-50/20 font-mono font-black text-green-700 italic text-lg">
+                    Rp {t.paid_amount.toLocaleString("id-ID")}
+                  </td>
+                  <td className="p-8 text-right bg-red-50/10 font-mono font-black text-red-600 italic text-lg">
+                    Rp {t.total_amount.toLocaleString("id-ID")}
+                  </td>
+                  <td className="p-8">
+                    <div className="flex flex-col items-center gap-3">
+                      <span
+                        className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase ${t.payment_status === "Paid" ? "bg-green-700 text-white" : "bg-red-50 text-red-500 border border-red-100"}`}
+                      >
+                        {t.payment_status}
+                      </span>
+                      <button
+                        onClick={() => handleDelete(t.id)}
+                        className="p-3 bg-red-50 text-red-500 rounded-2xl hover:bg-red-500 hover:text-white transition-all border border-red-100 shadow-sm"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="p-20 text-center text-gray-300 italic font-bold uppercase tracking-widest"
+                >
+                  Tidak ada data di periode ini
                 </td>
               </tr>
-            ))}
+            )}
           </tbody>
         </table>
-        {totalPages > 1 && (
-          <div className="p-8 flex justify-between items-center border-t bg-gray-50/30 font-black uppercase text-[10px] text-gray-400">
-            <span>
-              Hal {currentPage} dari {totalPages}
-            </span>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                disabled={currentPage === 1}
-                className="p-2 border rounded-lg hover:bg-white disabled:opacity-20 cursor-pointer"
-              >
-                <ChevronLeft size={20} />
-              </button>
-              <button
-                onClick={() =>
-                  setCurrentPage((p) => Math.min(totalPages, p + 1))
-                }
-                disabled={currentPage === totalPages}
-                className="p-2 border rounded-lg hover:bg-white disabled:opacity-20 cursor-pointer"
-              >
-                <ChevronRight size={20} />
-              </button>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );

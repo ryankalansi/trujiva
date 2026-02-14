@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase";
 import { useMemo } from "react";
 import {
@@ -11,12 +11,19 @@ import {
   Users,
   ClipboardList,
   LogOut,
+  Gift,
 } from "lucide-react";
 
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const supabase = useMemo(() => createClient(), []);
+
+  // Membaca periode dari URL untuk ditempel ke link menu
+  const month = searchParams.get("month");
+  const year = searchParams.get("year");
+  const queryString = month && year ? `?month=${month}&year=${year}` : "";
 
   const menuItems = [
     {
@@ -25,8 +32,9 @@ export default function Sidebar() {
       icon: <LayoutDashboard size={20} />,
     },
     { name: "Manajemen Produk", href: "/product", icon: <Package size={20} /> },
+    { name: "Manajemen Mitra", href: "/mitra", icon: <Users size={20} /> },
     {
-      name: "Input Penjualan",
+      name: "Input Pesanan Mitra",
       href: "/transaksi",
       icon: <ShoppingCart size={20} />,
     },
@@ -36,26 +44,23 @@ export default function Sidebar() {
       icon: <History size={20} />,
     },
     {
-      name: "Laporan Mitra",
+      name: "Penjualan Mitra",
       href: "/transaksi/mitra-report",
       icon: <ClipboardList size={20} />,
     },
-    { name: "Manajemen Mitra", href: "/mitra", icon: <Users size={20} /> },
+    { name: "Pengeluaran Sample", href: "/sample", icon: <Gift size={20} /> },
   ];
 
-  // FUNGSI LOGOUT REAL
   const handleLogout = async () => {
-    const confirmLogout = confirm("Apakah Anda yakin ingin keluar?");
-    if (confirmLogout) {
+    if (confirm("Apakah Anda yakin ingin keluar?")) {
       await supabase.auth.signOut();
-      router.push("/"); // Balik ke halaman login
+      router.push("/");
       router.refresh();
     }
   };
 
   return (
     <aside className="w-64 bg-green-900 text-white min-h-screen flex flex-col p-6 shadow-2xl border-r border-green-800">
-      {/* BRANDING */}
       <div className="mb-10 px-2">
         <h1 className="text-2xl font-black italic tracking-tighter text-white">
           TRUJIVA
@@ -65,15 +70,17 @@ export default function Sidebar() {
         </p>
       </div>
 
-      {/* NAVIGATION */}
       <nav className="flex-1 space-y-2">
         {menuItems.map((item) => {
           const isActive = pathname === item.href;
+          // Tempelkan queryString (periode) ke setiap link
+          const finalHref = `${item.href}${queryString}`;
+
           return (
             <Link
               key={item.name}
-              href={item.href}
-              className={`flex items-center gap-3 p-4 rounded-2xl transition-all font-bold text-sm cursor-pointer group ${
+              href={finalHref}
+              className={`flex items-center gap-3 p-4 rounded-2xl transition-all font-bold text-sm group ${
                 isActive
                   ? "bg-green-700 text-white shadow-lg border-l-4 border-green-400"
                   : "text-green-300/70 hover:bg-green-800 hover:text-white"
@@ -90,11 +97,10 @@ export default function Sidebar() {
         })}
       </nav>
 
-      {/* FOOTER / LOGOUT */}
       <div className="pt-6 border-t border-green-800">
         <button
           onClick={handleLogout}
-          className="flex items-center gap-3 p-4 w-full text-left text-green-400 hover:text-red-400 hover:bg-red-500/10 rounded-2xl transition-all font-black text-xs uppercase tracking-widest cursor-pointer group"
+          className="flex items-center gap-3 p-4 w-full text-left text-green-400 hover:text-red-400 hover:bg-red-500/10 rounded-2xl transition-all font-black text-xs uppercase tracking-widest group"
         >
           <LogOut
             size={20}

@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
+import { useSearchParams } from "next/navigation";
 import toast from "react-hot-toast";
 import {
   Search,
@@ -11,6 +12,7 @@ import {
   UserPlus,
   Edit3,
   Trash2,
+  CalendarDays,
 } from "lucide-react";
 
 interface InventoryItem {
@@ -47,11 +49,24 @@ interface RawInvItem {
   qty: number;
   remaining_qty_at_partner: number;
   product: { name: string; base_price: number } | null;
-  transactions: { mitra_id: string } | null;
+  transactions: { mitra_id: string; created_at: string } | null;
 }
 
 export default function MitraPage() {
   const supabase = useMemo(() => createClient(), []);
+  const searchParams = useSearchParams();
+
+  // --- 1. LOGIKA PERIODE GLOBAL ---
+  const selectedMonth = useMemo(
+    () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
+    [searchParams],
+  );
+
+  const selectedYear = useMemo(
+    () => Number(searchParams.get("year")) || new Date().getFullYear(),
+    [searchParams],
+  );
+
   const [mitraList, setMitraList] = useState<Mitra[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -63,78 +78,146 @@ export default function MitraPage() {
     is_rp: false,
   });
   const [isEditing, setIsEditing] = useState(false);
-
   const [searchTerm, setSearchTerm] = useState("");
   const [tierFilter, setTierFilter] = useState("All");
 
-  useEffect(() => {
-    let isMounted = true;
-    async function fetchData() {
-      const [mRes, tRes, rRes, iRes] = await Promise.all([
-        supabase.from("mitra").select("*").order("full_name"),
-        supabase.from("transactions").select("mitra_id, paid_amount"),
-        supabase.from("partner_reports").select("mitra_id, qty, selling_price"),
-        supabase
-          .from("transaction_items")
-          .select(
-            `qty, remaining_qty_at_partner, product:product_id(name, base_price), transactions!inner(mitra_id)`,
-          ),
-      ]);
+  const months = [
+    "Januari",
+    "Februari",
+    "Maret",
+    "April",
+    "Mei",
+    "Juni",
+    "Juli",
+    "Agustus",
+    "September",
+    "Oktober",
+    "November",
+    "Desember",
+  ];
 
-      if (mRes.data && isMounted) {
-        const rawM = mRes.data as RawMitra[];
-        const rawT = (tRes.data as unknown as RawTransaction[]) || [];
-        const rawR = (rRes.data as unknown as RawReport[]) || [];
-        const rawI = (iRes.data as unknown as RawInvItem[]) || [];
+  const fetchData = useCallback(async () => {
+    setLoading(true);
 
-        const enriched: Mitra[] = rawM.map((m) => {
-          const belanjaBersih = rawT
-            .filter((t) => t.mitra_id === m.id)
-            .reduce((a, c) => a + c.paid_amount, 0);
-          const omzet = rawR
-            .filter((r) => r.mitra_id === m.id)
-            .reduce((a, c) => a + c.selling_price * c.qty, 0);
-          const invItems = rawI.filter(
-            (inv) => inv.transactions?.mitra_id === m.id,
-          );
-          const totalKotor = invItems.reduce(
+    // Range tanggal untuk Filter Keuangan (Strict per bulan)
+    const start = new Date(
+      selectedYear,
+      selectedMonth - 1,
+      1,
+      0,
+      0,
+      0,
+      0,
+    ).toISOString();
+    const end = new Date(
+      selectedYear,
+      selectedMonth,
+      0,
+      23,
+      59,
+      59,
+      999,
+    ).toISOString();
+
+    const [mRes, tRes, rRes, iRes] = await Promise.all([
+      // 1. Ambil data mitra
+      supabase.from("mitra").select("*").order("full_name"),
+
+      // 2. Transaksi: Hanya bulan berjalan
+      supabase
+        .from("transactions")
+        .select("mitra_id, paid_amount")
+        .gte("created_at", start)
+        .lte("created_at", end),
+
+      // 3. Omzet Penjualan Mitra: Hanya bulan berjalan
+      supabase
+        .from("partner_reports")
+        .select("mitra_id, qty, selling_price")
+        .gte("created_at", start)
+        .lte("created_at", end),
+
+      // 4. Stok (Hybrid): Ambil semua data barang masuk dari awal s/d AKHIR bulan terpilih
+      supabase
+        .from("transaction_items")
+        .select(
+          `
+        qty, 
+        remaining_qty_at_partner, 
+        product:product_id(name, base_price), 
+        transactions!inner(mitra_id, created_at)
+      `,
+        )
+        .lte("transactions.created_at", end),
+    ]);
+
+    if (mRes.data) {
+      const rawM = mRes.data as RawMitra[];
+      const rawT = (tRes.data as unknown as RawTransaction[]) || [];
+      const rawR = (rRes.data as unknown as RawReport[]) || [];
+      const rawI = (iRes.data as unknown as RawInvItem[]) || [];
+
+      const enriched: Mitra[] = rawM.map((m) => {
+        // Keuangan bersifat bulanan
+        const belanjaBersih = rawT
+          .filter((t) => t.mitra_id === m.id)
+          .reduce((a, c) => a + c.paid_amount, 0);
+        const omzet = rawR
+          .filter((r) => r.mitra_id === m.id)
+          .reduce((a, c) => a + c.selling_price * c.qty, 0);
+
+        // Filter Inventaris Milik Mitra Ini
+        const myInv = rawI.filter((inv) => inv.transactions?.mitra_id === m.id);
+
+        // Bruto: Hitung belanja kotor khusus bulan ini
+        const totalKotorBulanIni = myInv
+          .filter(
+            (inv) => inv.transactions && inv.transactions.created_at >= start,
+          )
+          .reduce(
             (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
             0,
           );
 
-          const grouped = invItems.reduce(
-            (acc: Record<string, { rem: number; tot: number }>, curr) => {
-              const name = curr.product?.name || "Produk";
-              if (!acc[name]) acc[name] = { rem: 0, tot: 0 };
-              acc[name].rem += curr.remaining_qty_at_partner;
-              acc[name].tot += curr.qty;
-              return acc;
-            },
-            {},
-          );
+        // Grouping Stok (Kumulatif): Sisa stok tetap muncul meskipun barang dibeli bulan lalu
+        const groupedStok = myInv.reduce(
+          (acc: Record<string, { rem: number; tot: number }>, curr) => {
+            const name = curr.product?.name || "Produk";
+            if (!acc[name]) acc[name] = { rem: 0, tot: 0 };
+            acc[name].rem += curr.remaining_qty_at_partner; // Sisa botol nyata
+            acc[name].tot += curr.qty; // Total masuk historis
+            return acc;
+          },
+          {},
+        );
 
-          return {
-            ...m,
-            belanjaPusat: belanjaBersih,
-            penjualanKonsumen: omzet,
-            belanjaKotorAkumulasi: totalKotor,
-            inventory: Object.entries(grouped).map(([name, val]) => ({
-              name,
-              rem: val.rem,
-              tot: val.tot,
-            })),
-          };
-        });
+        return {
+          ...m,
+          belanjaPusat: belanjaBersih,
+          penjualanKonsumen: omzet,
+          belanjaKotorAkumulasi: totalKotorBulanIni,
+          inventory: Object.entries(groupedStok).map(([name, val]) => ({
+            name,
+            rem: val.rem,
+            tot: val.tot,
+          })),
+        };
+      });
 
-        setMitraList(enriched);
-        setLoading(false);
-      }
+      setMitraList(enriched);
+      setLoading(false);
     }
-    fetchData();
+  }, [supabase, selectedMonth, selectedYear]);
+
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      if (isMounted) await fetchData();
+    })();
     return () => {
       isMounted = false;
     };
-  }, [supabase, refreshKey]);
+  }, [fetchData, refreshKey]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -182,11 +265,19 @@ export default function MitraPage() {
 
   return (
     <div className="p-8 max-w-7xl mx-auto font-sans text-gray-900">
-      <header className="mb-10 flex items-center gap-3">
-        <Users size={36} className="text-green-900" />
-        <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
-          Database Mitra & Analisis
-        </h1>
+      <header className="mb-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div className="flex items-center gap-3">
+          <Users size={36} className="text-green-900" />
+          <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
+            Database Mitra & Analisis
+          </h1>
+        </div>
+        <div className="bg-blue-50 px-4 py-2 rounded-2xl border border-blue-100 flex items-center gap-2">
+          <CalendarDays size={16} className="text-blue-600" />
+          <span className="text-[10px] font-black uppercase text-blue-600 tracking-widest">
+            Periode Analisis: {months[selectedMonth - 1]} {selectedYear}
+          </span>
+        </div>
       </header>
 
       {/* Form Pendaftaran */}
@@ -310,21 +401,27 @@ export default function MitraPage() {
                   </span>
                 </td>
                 <td className="p-8">
-                  {m.inventory.map((inv, i) => (
-                    <div
-                      key={i}
-                      className="text-[10px] font-black text-gray-400 uppercase italic mb-1"
-                    >
-                      <Package
-                        size={10}
-                        className="inline mr-1 text-green-600"
-                      />
-                      {inv.name}:{" "}
-                      <span className="text-green-700">
-                        {inv.rem} / {inv.tot}
-                      </span>
-                    </div>
-                  ))}
+                  {m.inventory.length > 0 ? (
+                    m.inventory.map((inv, i) => (
+                      <div
+                        key={i}
+                        className="text-[10px] font-black text-gray-400 uppercase italic mb-1"
+                      >
+                        <Package
+                          size={10}
+                          className="inline mr-1 text-green-600"
+                        />
+                        {inv.name}:{" "}
+                        <span className="text-green-700">
+                          {inv.rem} / {inv.tot}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <span className="text-[10px] text-gray-300 italic">
+                      No Inventory
+                    </span>
+                  )}
                 </td>
                 <td className="p-8 text-right font-mono font-black text-orange-600 italic text-lg border-r bg-orange-50/10">
                   Rp {m.belanjaKotorAkumulasi.toLocaleString("id-ID")}
