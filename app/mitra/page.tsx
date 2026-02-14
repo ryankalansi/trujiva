@@ -56,7 +56,6 @@ export default function MitraPage() {
   const supabase = useMemo(() => createClient(), []);
   const searchParams = useSearchParams();
 
-  // --- 1. LOGIKA PERIODE GLOBAL ---
   const selectedMonth = useMemo(
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
@@ -98,8 +97,6 @@ export default function MitraPage() {
 
   const fetchData = useCallback(async () => {
     setLoading(true);
-
-    // Range tanggal untuk Filter Keuangan (Strict per bulan)
     const start = new Date(
       selectedYear,
       selectedMonth - 1,
@@ -120,33 +117,21 @@ export default function MitraPage() {
     ).toISOString();
 
     const [mRes, tRes, rRes, iRes] = await Promise.all([
-      // 1. Ambil data mitra
       supabase.from("mitra").select("*").order("full_name"),
-
-      // 2. Transaksi: Hanya bulan berjalan
       supabase
         .from("transactions")
         .select("mitra_id, paid_amount")
         .gte("created_at", start)
         .lte("created_at", end),
-
-      // 3. Omzet Penjualan Mitra: Hanya bulan berjalan
       supabase
         .from("partner_reports")
         .select("mitra_id, qty, selling_price")
         .gte("created_at", start)
         .lte("created_at", end),
-
-      // 4. Stok (Hybrid): Ambil semua data barang masuk dari awal s/d AKHIR bulan terpilih
       supabase
         .from("transaction_items")
         .select(
-          `
-        qty, 
-        remaining_qty_at_partner, 
-        product:product_id(name, base_price), 
-        transactions!inner(mitra_id, created_at)
-      `,
+          `qty, remaining_qty_at_partner, product:product_id(name, base_price), transactions!inner(mitra_id, created_at)`,
         )
         .lte("transactions.created_at", end),
     ]);
@@ -158,18 +143,13 @@ export default function MitraPage() {
       const rawI = (iRes.data as unknown as RawInvItem[]) || [];
 
       const enriched: Mitra[] = rawM.map((m) => {
-        // Keuangan bersifat bulanan
         const belanjaBersih = rawT
           .filter((t) => t.mitra_id === m.id)
           .reduce((a, c) => a + c.paid_amount, 0);
         const omzet = rawR
           .filter((r) => r.mitra_id === m.id)
           .reduce((a, c) => a + c.selling_price * c.qty, 0);
-
-        // Filter Inventaris Milik Mitra Ini
         const myInv = rawI.filter((inv) => inv.transactions?.mitra_id === m.id);
-
-        // Bruto: Hitung belanja kotor khusus bulan ini
         const totalKotorBulanIni = myInv
           .filter(
             (inv) => inv.transactions && inv.transactions.created_at >= start,
@@ -179,13 +159,12 @@ export default function MitraPage() {
             0,
           );
 
-        // Grouping Stok (Kumulatif): Sisa stok tetap muncul meskipun barang dibeli bulan lalu
         const groupedStok = myInv.reduce(
           (acc: Record<string, { rem: number; tot: number }>, curr) => {
             const name = curr.product?.name || "Produk";
             if (!acc[name]) acc[name] = { rem: 0, tot: 0 };
-            acc[name].rem += curr.remaining_qty_at_partner; // Sisa botol nyata
-            acc[name].tot += curr.qty; // Total masuk historis
+            acc[name].rem += curr.remaining_qty_at_partner;
+            acc[name].tot += curr.qty;
             return acc;
           },
           {},
@@ -223,13 +202,14 @@ export default function MitraPage() {
     e.preventDefault();
     const payload = {
       full_name: form.name,
-      current_tier: form.is_rp ? "Reseller" : form.tier,
+      current_tier: form.tier, // Langsung ambil dari form tier, tidak dipaksa Reseller lagi
       is_rp: form.is_rp,
     };
     const toastId = toast.loading("Processing...");
     const { error } = isEditing
       ? await supabase.from("mitra").update(payload).eq("id", form.id)
       : await supabase.from("mitra").insert([payload]);
+
     if (!error) {
       toast.success("Berhasil!", { id: toastId });
       setIsEditing(false);
@@ -294,24 +274,32 @@ export default function MitraPage() {
             placeholder="Nama Lengkap"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold"
+            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
             required
           />
+
           <select
             value={form.is_rp ? "RP" : "REGULER"}
-            onChange={(e) =>
-              setForm({ ...form, is_rp: e.target.value === "RP" })
-            }
-            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold"
+            onChange={(e) => {
+              const isRP = e.target.value === "RP";
+              // Perbaikan: Jika berubah ke RP, default ke Reseller, tapi dropdown tetap dibuka
+              setForm({
+                ...form,
+                is_rp: isRP,
+                tier: isRP ? "Reseller" : form.tier,
+              });
+            }}
+            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
           >
             <option value="REGULER">Mitra Reguler</option>
             <option value="RP">Rumah Perubahan (VIP)</option>
           </select>
+
+          {/* Dropdown Tier: Sekarang selalu dibuka (tidak disabled) */}
           <select
-            disabled={form.is_rp}
-            value={form.is_rp ? "Reseller" : form.tier}
+            value={form.tier}
             onChange={(e) => setForm({ ...form, tier: e.target.value })}
-            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold disabled:opacity-50"
+            className={`p-4 border rounded-2xl font-bold outline-none focus:ring-2 ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700 focus:ring-blue-500" : "bg-gray-50 border-gray-200 focus:ring-green-500"}`}
           >
             <option value="Member">Member</option>
             <option value="Reseller">Reseller</option>
@@ -321,13 +309,13 @@ export default function MitraPage() {
           </select>
         </div>
         <button
-          className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs ${isEditing ? "bg-orange-500" : "bg-green-800 hover:bg-green-900"}`}
+          className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs transition-all ${isEditing ? "bg-orange-500 hover:bg-orange-600" : "bg-green-800 hover:bg-green-900"}`}
         >
-          {isEditing ? "Update Data" : "Daftarkan Sekarang"}
+          {isEditing ? "Update Data Mitra" : "Daftarkan Sekarang"}
         </button>
       </form>
 
-      {/* Toolbar Search & Filter */}
+      {/* Search & Table tetap sama */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
         <div className="md:col-span-2 relative">
           <Search
@@ -380,10 +368,7 @@ export default function MitraPage() {
           </thead>
           <tbody className="divide-y divide-gray-50">
             {filtered.map((m, idx) => (
-              <tr
-                key={m.id}
-                className="hover:bg-gray-50 transition-all cursor-default group"
-              >
+              <tr key={m.id} className="hover:bg-gray-50 transition-all group">
                 <td className="p-8 text-center font-bold text-gray-300 border-r">
                   {idx + 1}
                 </td>
@@ -401,27 +386,21 @@ export default function MitraPage() {
                   </span>
                 </td>
                 <td className="p-8">
-                  {m.inventory.length > 0 ? (
-                    m.inventory.map((inv, i) => (
-                      <div
-                        key={i}
-                        className="text-[10px] font-black text-gray-400 uppercase italic mb-1"
-                      >
-                        <Package
-                          size={10}
-                          className="inline mr-1 text-green-600"
-                        />
-                        {inv.name}:{" "}
-                        <span className="text-green-700">
-                          {inv.rem} / {inv.tot}
-                        </span>
-                      </div>
-                    ))
-                  ) : (
-                    <span className="text-[10px] text-gray-300 italic">
-                      No Inventory
-                    </span>
-                  )}
+                  {m.inventory.map((inv, i) => (
+                    <div
+                      key={i}
+                      className="text-[10px] font-black text-gray-400 uppercase italic mb-1"
+                    >
+                      <Package
+                        size={10}
+                        className="inline mr-1 text-green-600"
+                      />
+                      {inv.name}:{" "}
+                      <span className="text-green-700">
+                        {inv.rem} / {inv.tot}
+                      </span>
+                    </div>
+                  ))}
                 </td>
                 <td className="p-8 text-right font-mono font-black text-orange-600 italic text-lg border-r bg-orange-50/10">
                   Rp {m.belanjaKotorAkumulasi.toLocaleString("id-ID")}
@@ -430,10 +409,8 @@ export default function MitraPage() {
                   Rp {m.belanjaPusat.toLocaleString("id-ID")}
                 </td>
                 <td className="p-8 text-right font-mono font-black text-blue-700 italic text-lg bg-blue-50/5 border-r">
-                  <div className="flex items-center justify-end gap-2">
-                    Rp {m.penjualanKonsumen.toLocaleString("id-ID")}{" "}
-                    <TrendingUp size={16} className="text-blue-400" />
-                  </div>
+                  Rp {m.penjualanKonsumen.toLocaleString("id-ID")}{" "}
+                  <TrendingUp size={16} className="inline text-blue-400 ml-1" />
                 </td>
                 <td className="p-8 text-center">
                   <div className="flex justify-center gap-4">

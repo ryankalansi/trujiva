@@ -339,7 +339,7 @@ export default function LaporanPenjualanMitra() {
 
           <div className="md:col-span-2">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 ml-1">
-              Total Omzet (Rp)
+              Total Penjualan (Rp)
             </label>
             <input
               type="text"

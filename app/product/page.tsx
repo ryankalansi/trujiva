@@ -175,7 +175,7 @@ export default function ManagementProduk() {
         </div>
         <div>
           <label className="text-[10px] font-black uppercase text-gray-400 block mb-2">
-            Harga Base
+            Harga Jual (Rp)
           </label>
           <input
             type="text"
