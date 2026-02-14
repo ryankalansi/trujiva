@@ -19,6 +19,8 @@ interface PartnerReport {
   id: string;
   qty: number;
   selling_price: number;
+  base_price_at_time: number; // Tambahkan untuk audit
+  commission_rate: number; // Selisih untung per botol
   created_at: string;
   mitra: { full_name: string; current_tier: string } | null;
   product: { name: string } | null;
@@ -39,12 +41,10 @@ export default function LaporanPenjualanMitra() {
   const supabase = useMemo(() => createClient(), []);
   const searchParams = useSearchParams();
 
-  // --- 1. LOGIKA PERIODE GLOBAL (SINKRON DASHBOARD) ---
   const selectedMonth = useMemo(
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
   );
-
   const selectedYear = useMemo(
     () => Number(searchParams.get("year")) || new Date().getFullYear(),
     [searchParams],
@@ -55,13 +55,10 @@ export default function LaporanPenjualanMitra() {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Form States
   const [selectedMitra, setSelectedMitra] = useState("");
   const [selectedProduct, setSelectedProduct] = useState("");
   const [qtyToSell, setQtyToSell] = useState(1);
   const [totalOmzetInput, setTotalOmzetInput] = useState(0);
-
-  // Fitur Backdate: Sinkron dengan URL
   const [reportDateInput, setReportDateInput] = useState("");
 
   const months = [
@@ -79,22 +76,36 @@ export default function LaporanPenjualanMitra() {
     "Desember",
   ];
 
-  // --- FIX: SINKRONISASI TANGGAL DEFAULT KE URL ---
   useEffect(() => {
     const monthStr = String(selectedMonth).padStart(2, "0");
     const today = new Date();
-
-    // Jika bulan di URL adalah bulan berjalan, pakai hari ini
     if (
       selectedMonth === today.getMonth() + 1 &&
       selectedYear === today.getFullYear()
     ) {
       setReportDateInput(today.toISOString().split("T")[0]);
     } else {
-      // Jika di Januari (masa lalu), set ke tanggal 01 bulan tersebut
       setReportDateInput(`${selectedYear}-${monthStr}-01`);
     }
   }, [selectedMonth, selectedYear]);
+
+  // FIX: Fungsi pendeteksi tier historis berdasarkan harga modal barang yang dijual
+  const getHistoricalTierLabel = (r: PartnerReport) => {
+    if (!r.base_price_at_time || r.base_price_at_time === 0)
+      return r.mitra?.current_tier || "Member";
+
+    // Hitung modal per item (Selling Price - Profit = Modal)
+    const modalPerItem = r.selling_price - r.commission_rate;
+    const discountPercent = Math.round(
+      (1 - modalPerItem / r.base_price_at_time) * 100,
+    );
+
+    if (discountPercent >= 44) return "Distributor"; // 45%
+    if (discountPercent >= 34) return "Agen"; // 35%
+    if (discountPercent >= 24) return "Sub-Agen"; // 25%
+    if (discountPercent >= 14) return "Reseller"; // 15%
+    return "Member";
+  };
 
   const fetchReports = useCallback(async () => {
     const start = new Date(
@@ -119,7 +130,7 @@ export default function LaporanPenjualanMitra() {
     const { data } = await supabase
       .from("partner_reports")
       .select(
-        `id, qty, selling_price, created_at, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
+        `id, qty, selling_price, base_price_at_time, commission_rate, created_at, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
       )
       .gte("created_at", start)
       .lte("created_at", end)
@@ -203,14 +214,19 @@ export default function LaporanPenjualanMitra() {
             item.transactions.total_amount,
             subTotalModal,
           );
-          const newTotal = item.transactions.total_amount - amountToShift;
-          const newPaid = item.transactions.paid_amount + amountToShift;
           await supabase
             .from("transactions")
             .update({
-              total_amount: Math.round(newTotal),
-              paid_amount: Math.round(newPaid),
-              payment_status: newTotal <= 1 ? "Paid" : "Unpaid",
+              total_amount: Math.round(
+                item.transactions.total_amount - amountToShift,
+              ),
+              paid_amount: Math.round(
+                item.transactions.paid_amount + amountToShift,
+              ),
+              payment_status:
+                item.transactions.total_amount - amountToShift <= 1
+                  ? "Paid"
+                  : "Unpaid",
             })
             .eq("id", item.transaction_id);
         }
@@ -219,7 +235,6 @@ export default function LaporanPenjualanMitra() {
 
       const pricePerItem = totalOmzetInput / qtyToSell;
       const commissionPerItem = pricePerItem - totalModalCalculated / qtyToSell;
-
       const finalCreatedAt = new Date(
         `${reportDateInput}T${new Date().toTimeString().split(" ")[0]}`,
       ).toISOString();
@@ -284,10 +299,9 @@ export default function LaporanPenjualanMitra() {
               type="date"
               value={reportDateInput}
               onChange={(e) => setReportDateInput(e.target.value)}
-              className="w-full bg-transparent font-bold text-orange-900 outline-none cursor-pointer"
+              className="w-full bg-transparent font-bold text-orange-900 outline-none"
             />
           </div>
-
           <div className="md:col-span-3">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 ml-1">
               Mitra
@@ -295,7 +309,7 @@ export default function LaporanPenjualanMitra() {
             <select
               value={selectedMitra}
               onChange={(e) => setSelectedMitra(e.target.value)}
-              className="w-full p-4 bg-gray-50 border border-gray-100 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
             >
               <option value="">-- Pilih Mitra --</option>
               {mitraList.map((m) => (
@@ -305,7 +319,6 @@ export default function LaporanPenjualanMitra() {
               ))}
             </select>
           </div>
-
           <div className="md:col-span-3">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 ml-1">
               Produk
@@ -313,7 +326,7 @@ export default function LaporanPenjualanMitra() {
             <select
               value={selectedProduct}
               onChange={(e) => setSelectedProduct(e.target.value)}
-              className="w-full p-4 bg-gray-50 border border-gray-100 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
             >
               <option value="">-- Pilih Produk --</option>
               {products.map((p) => (
@@ -323,7 +336,6 @@ export default function LaporanPenjualanMitra() {
               ))}
             </select>
           </div>
-
           <div className="md:col-span-1">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 text-center">
               Qty
@@ -332,11 +344,10 @@ export default function LaporanPenjualanMitra() {
               type="number"
               value={qtyToSell}
               onChange={(e) => setQtyToSell(Number(e.target.value))}
-              className="w-full p-4 bg-gray-50 border border-gray-100 rounded-2xl font-black text-center"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-black text-center"
               min="1"
             />
           </div>
-
           <div className="md:col-span-2">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 ml-1">
               Total Penjualan (Rp)
@@ -347,12 +358,11 @@ export default function LaporanPenjualanMitra() {
               onChange={(e) =>
                 setTotalOmzetInput(Number(e.target.value.replace(/\D/g, "")))
               }
-              className="w-full p-4 bg-gray-50 border border-gray-100 rounded-2xl font-bold"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold"
               placeholder="Total Duit..."
             />
           </div>
         </div>
-
         <button
           type="submit"
           className="w-full bg-green-800 text-white py-5 rounded-2xl font-black uppercase shadow-lg hover:bg-green-900 transition-all active:scale-[0.98]"
@@ -384,8 +394,9 @@ export default function LaporanPenjualanMitra() {
                     <div className="font-bold text-gray-800 uppercase">
                       {r.mitra?.full_name}
                     </div>
+                    {/* FIX: Tampilkan Label Tier Historis */}
                     <div className="text-[9px] font-black uppercase text-green-600">
-                      {r.mitra?.current_tier}
+                      {getHistoricalTierLabel(r)}
                     </div>
                   </td>
                   <td className="p-8 text-center font-black text-lg">
