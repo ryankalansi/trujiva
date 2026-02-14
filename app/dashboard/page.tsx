@@ -16,7 +16,6 @@ import {
   Gift,
 } from "lucide-react";
 
-// --- Interface Definisi Data ---
 interface DashboardStats {
   omzetKotor: number;
   dibayarKePusat: number;
@@ -53,6 +52,7 @@ interface PartnerReportJoin {
   product: { name: string } | null;
   qty: number;
   selling_price: number;
+  commission_rate: number;
   created_at: string;
 }
 interface StatCardProps {
@@ -64,15 +64,6 @@ interface StatCardProps {
   isCurrency?: boolean;
 }
 
-interface ExcelKasRow {
-  "NO": number | string;
-  "TANGGAL": string;
-  "MITRA": string;
-  "STATUS": string;
-  "DIBAYAR KE PUSAT": string;
-  "SISA PIUTANG": string;
-}
-
 export default function ExecutiveDashboard() {
   const supabase = useMemo(() => createClient(), []);
   const router = useRouter();
@@ -82,7 +73,6 @@ export default function ExecutiveDashboard() {
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
   );
-
   const selectedYear = useMemo(
     () => Number(searchParams.get("year")) || new Date().getFullYear(),
     [searchParams],
@@ -103,7 +93,7 @@ export default function ExecutiveDashboard() {
   >([]);
   const [rawPartnerReports, setRawPartnerReports] = useState<
     PartnerReportJoin[]
-  >([]);
+  >([]); // Sekarang akan digunakan
 
   const months = [
     "Januari",
@@ -119,7 +109,6 @@ export default function ExecutiveDashboard() {
     "November",
     "Desember",
   ];
-  const years = [2026];
 
   const updateURL = (month: number, year: number) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -149,53 +138,64 @@ export default function ExecutiveDashboard() {
       999,
     ).toISOString();
 
-    const [reportsRes, prodsRes, itemsRes, mitraRes] = await Promise.all([
-      supabase
-        .from("partner_reports")
-        .select(
-          "qty, selling_price, mitra_id, created_at, product:product_id(name)",
-        )
-        .gte("created_at", startOfMonth)
-        .lte("created_at", endOfMonth),
-      supabase.from("products").select("*"),
-      supabase
-        .from("transaction_items")
-        .select(
-          `
-          qty, product_id, remaining_qty_at_partner, 
-          product:product_id(name, base_price), 
-          transactions!inner(id, created_at, payment_method, payment_status, paid_amount, total_amount, is_sample, mitra:mitra_id(id, full_name, current_tier))
-        `,
-        )
-        .gte("transactions.created_at", startOfMonth)
-        .lte("transactions.created_at", endOfMonth),
-      supabase.from("mitra").select("id", { count: "exact", head: true }),
-    ]);
+    const [reportsRes, prodsRes, itemsRes, allPiutangRes, mitraRes] =
+      await Promise.all([
+        supabase
+          .from("partner_reports")
+          .select(
+            "qty, selling_price, commission_rate, mitra_id, created_at, product:product_id(name)",
+          )
+          .gte("created_at", startOfMonth)
+          .lte("created_at", endOfMonth),
+        supabase.from("products").select("*"),
+        supabase
+          .from("transaction_items")
+          .select(
+            `qty, product_id, remaining_qty_at_partner, product:product_id(name, base_price), transactions!inner(id, created_at, payment_method, payment_status, paid_amount, total_amount, is_sample, mitra:mitra_id(id, full_name, current_tier))`,
+          )
+          .gte("transactions.created_at", startOfMonth)
+          .lte("transactions.created_at", endOfMonth),
+        supabase
+          .from("transaction_items")
+          .select(
+            `remaining_qty_at_partner, price_at_time, transactions!inner(is_sample)`,
+          )
+          .gt("remaining_qty_at_partner", 0)
+          .eq("transactions.is_sample", false),
+        supabase.from("mitra").select("id", { count: "exact", head: true }),
+      ]);
 
     if (prodsRes.data && reportsRes.data && itemsRes.data) {
       const items = itemsRes.data as unknown as TransactionItemJoin[];
       const reports = reportsRes.data as unknown as PartnerReportJoin[];
+      const piutangBatches = allPiutangRes.data || [];
+
       setRawPartnerReports(reports);
       setRawTransactionItems(items);
 
-      const totalPaid = items
+      const totalPaidDirect = items
         .filter((i) => !i.transactions?.is_sample)
         .reduce((a, c) => a + (c.transactions?.paid_amount || 0), 0);
-      const totalUnpaid = items
-        .filter((i) => !i.transactions?.is_sample)
-        .reduce((a, c) => a + (c.transactions?.total_amount || 0), 0);
+      const totalPelunasanPiutang = reports.reduce(
+        (a, c) => a + (c.selling_price - c.commission_rate) * c.qty,
+        0,
+      );
+      const totalOutstandingPiutang = piutangBatches.reduce(
+        (a, c) => a + c.remaining_qty_at_partner * c.price_at_time,
+        0,
+      );
       const totalOmzetMitra = reports.reduce(
         (a, c) => a + c.selling_price * c.qty,
         0,
       );
-      const costSample = items
-        .filter((i) => i.transactions?.is_sample)
+      const totalBruto = items
+        .filter((i) => !i.transactions?.is_sample)
         .reduce(
           (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
           0,
         );
-      const totalBruto = items
-        .filter((i) => !i.transactions?.is_sample)
+      const costSample = items
+        .filter((i) => i.transactions?.is_sample)
         .reduce(
           (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
           0,
@@ -203,8 +203,8 @@ export default function ExecutiveDashboard() {
 
       setStats({
         omzetKotor: totalBruto,
-        dibayarKePusat: totalPaid,
-        piutangMitra: totalUnpaid,
+        dibayarKePusat: totalPaidDirect + totalPelunasanPiutang,
+        piutangMitra: totalOutstandingPiutang,
         omzetKonsumen: totalOmzetMitra,
         totalMitra: mitraRes.count || 0,
         biayaSample: costSample,
@@ -231,9 +231,7 @@ export default function ExecutiveDashboard() {
   useEffect(() => {
     let isMounted = true;
     (async () => {
-      if (isMounted) {
-        await fetchDashboardData();
-      }
+      if (isMounted) await fetchDashboardData();
     })();
     return () => {
       isMounted = false;
@@ -247,140 +245,46 @@ export default function ExecutiveDashboard() {
       return alert("Data periode ini masih kosong!");
     const wb = XLSX.utils.book_new();
 
-    // --- SHEET 1: RINGKASAN ARUS KAS ---
-    const activeItems = rawTransactionItems.filter(
-      (i) => !i.transactions?.is_sample,
-    );
-    const dataKas: ExcelKasRow[] = activeItems.map((item, idx) => ({
-      "NO": idx + 1,
-      "TANGGAL": new Date(
-        item.transactions?.created_at || "",
-      ).toLocaleDateString("id-ID"),
-      "MITRA": item.transactions?.mitra?.full_name || "N/A",
-      "STATUS": item.transactions?.payment_status || "N/A",
-      "DIBAYAR KE PUSAT": toIDR(item.transactions?.paid_amount || 0),
-      "SISA PIUTANG": toIDR(item.transactions?.total_amount || 0),
-    }));
-
-    dataKas.push({
-      "NO": "",
-      "TANGGAL": "TOTAL AKUMULASI",
-      "MITRA": "",
-      "STATUS": "",
-      "DIBAYAR KE PUSAT": toIDR(stats.dibayarKePusat),
-      "SISA PIUTANG": toIDR(stats.piutangMitra),
-    });
+    // Sheet 1: Arus Kas
+    const dataKas = rawTransactionItems
+      .filter((i) => !i.transactions?.is_sample)
+      .map((item, idx) => ({
+        "NO": idx + 1,
+        "TANGGAL": new Date(
+          item.transactions?.created_at || "",
+        ).toLocaleDateString("id-ID"),
+        "MITRA": item.transactions?.mitra?.full_name || "N/A",
+        "STATUS": item.transactions?.payment_status || "N/A",
+        "DIBAYAR KE PUSAT (DP)": toIDR(item.transactions?.paid_amount || 0),
+        "SISA PIUTANG": toIDR(item.transactions?.total_amount || 0),
+      }));
     XLSX.utils.book_append_sheet(
       wb,
       XLSX.utils.json_to_sheet(dataKas),
-      "1. Arus Kas",
+      "1. Arus Kas Transaksi",
     );
 
-    // --- SHEET 2: AUDIT STOK ---
-    const dataAudit = auditStok.map((item) => ({
-      "PRODUK": item.name,
-      "STOK AWAL PERIODE": item.stokAwal,
-      "BARANG KELUAR": item.barangKeluar,
-      "SISA STOK GUDANG": item.sisaStok,
-      "STATUS": item.status,
-    }));
-    XLSX.utils.book_append_sheet(
-      wb,
-      XLSX.utils.json_to_sheet(dataAudit),
-      "2. Audit Stok",
-    );
-
-    // --- SHEET 3: DATA MITRA & KOMISI ---
-    const uniqueMitraIds = Array.from(
-      new Set(activeItems.map((i) => i.transactions?.mitra?.id)),
-    );
-    const commissionMap: Record<string, string> = {
-      "Member": "0%",
-      "Reseller": "15%",
-      "Sub-Agen": "25%",
-      "Agen": "35%",
-      "Distributor": "45%",
-    };
-    const dataMitra = uniqueMitraIds.map((id, idx) => {
-      const m = activeItems.find((i) => i.transactions?.mitra?.id === id)
-        ?.transactions?.mitra;
-      return {
-        "NO": idx + 1,
-        "NAMA MITRA": m?.full_name || "N/A",
-        "TIER LEVEL": m?.current_tier || "N/A",
-        "DISKON KOMISI": commissionMap[m?.current_tier || ""] || "0%",
-      };
-    });
-    XLSX.utils.book_append_sheet(
-      wb,
-      XLSX.utils.json_to_sheet(dataMitra),
-      "3. Data Mitra",
-    );
-
-    // --- SHEET 4: INDIVIDUAL MITRA ---
-    uniqueMitraIds.forEach((mId) => {
-      if (!mId) return;
-      const mTrans = activeItems.filter(
-        (i) => i.transactions?.mitra?.id === mId,
-      );
-      const mReports = rawPartnerReports.filter((r) => r.mitra_id === mId);
-      const mName = mTrans[0].transactions?.mitra?.full_name || "Unknown";
-
-      const detailRows = mTrans.map((f, i) => {
-        const report = mReports.find(
-          (r) => r.product?.name === f.product?.name,
-        );
-        return {
-          "NO": i + 1,
-          "TANGGAL": new Date(
-            f.transactions?.created_at || "",
-          ).toLocaleDateString("id-ID"),
-          "PRODUK": f.product?.name || "N/A",
-          "QTY DIAMBIL": f.qty,
-          "STOK DI TANGAN": f.remaining_qty_at_partner,
-          "OMZET PENJUALAN": toIDR(
-            report ? report.qty * report.selling_price : 0,
-          ),
-          "MODAL KE PUSAT": toIDR(f.transactions?.paid_amount || 0),
-          "PIUTANG": toIDR(f.transactions?.total_amount || 0),
-        };
-      });
-      XLSX.utils.book_append_sheet(
-        wb,
-        XLSX.utils.json_to_sheet(detailRows),
-        `${mName}`.substring(0, 31),
-      );
-    });
-
-    // --- SHEET 5: RIWAYAT SAMPLE ---
-    const sampleItems = rawTransactionItems.filter(
-      (i) => i.transactions?.is_sample,
-    );
-    const dataSample = sampleItems.map((item, idx) => ({
+    // Sheet 2: Pelunasan dari Laporan Jualan (FIX ESLint: Gunakan rawPartnerReports di sini)
+    const dataLaporan = rawPartnerReports.map((r, idx) => ({
       "NO": idx + 1,
-      "TANGGAL": new Date(
-        item.transactions?.created_at || "",
-      ).toLocaleDateString("id-ID"),
-      "PRODUK": item.product?.name || "N/A",
-      "QTY": item.qty,
-      "ESTIMASI VALUE": toIDR(item.qty * (item.product?.base_price || 0)),
+      "TANGGAL LAPOR": new Date(r.created_at).toLocaleDateString("id-ID"),
+      "PRODUK": r.product?.name || "N/A",
+      "QTY LAKU": r.qty,
+      "DANA MASUK PUSAT": toIDR((r.selling_price - r.commission_rate) * r.qty),
     }));
     XLSX.utils.book_append_sheet(
       wb,
-      XLSX.utils.json_to_sheet(dataSample),
-      "5. Riwayat Sample",
+      XLSX.utils.json_to_sheet(dataLaporan),
+      "2. Pelunasan Piutang",
     );
 
-    XLSX.writeFile(
-      wb,
-      `TRUJIVA_MASTER_REPORT_${months[selectedMonth - 1]}_${selectedYear}.xlsx`,
-    );
+    XLSX.writeFile(wb, `TRUJIVA_REPORT_${months[selectedMonth - 1]}.xlsx`);
   };
 
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Syncing Dashboard {months[selectedMonth - 1]}...
+        Syncing Dashboard...
       </div>
     );
 
@@ -404,32 +308,17 @@ export default function ExecutiveDashboard() {
             <select
               value={selectedMonth}
               onChange={(e) => updateURL(Number(e.target.value), selectedYear)}
-              className="text-xs font-black uppercase outline-none bg-transparent cursor-pointer"
+              className="text-xs font-black uppercase outline-none bg-transparent"
             >
-              {months.map((m, i) => {
-                const monthIndex = i + 1;
-                if (
-                  monthIndex > new Date().getMonth() + 1 &&
-                  selectedYear === new Date().getFullYear()
-                )
-                  return null;
-                return (
-                  <option key={m} value={monthIndex}>
-                    {m}
-                  </option>
-                );
-              })}
-            </select>
-            <select
-              value={selectedYear}
-              onChange={(e) => updateURL(selectedMonth, Number(e.target.value))}
-              className="text-xs font-black uppercase outline-none bg-transparent cursor-pointer"
-            >
-              {years.map((y) => (
-                <option key={y} value={y}>
-                  {y}
-                </option>
-              ))}
+              {months.map(
+                (m, i) =>
+                  (i + 1 <= new Date().getMonth() + 1 ||
+                    selectedYear < new Date().getFullYear()) && (
+                    <option key={m} value={i + 1}>
+                      {m}
+                    </option>
+                  ),
+              )}
             </select>
           </div>
           <button
@@ -487,9 +376,6 @@ export default function ExecutiveDashboard() {
           <h2 className="text-xl font-black text-green-900 italic uppercase flex items-center gap-2">
             <Package size={24} /> Audit Stok Gudang
           </h2>
-          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">
-            Update Real-time
-          </span>
         </div>
         <div className="p-8 overflow-x-auto">
           <table className="w-full text-left">

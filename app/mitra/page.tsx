@@ -4,12 +4,9 @@ import { createClient } from "@/lib/supabase";
 import { useSearchParams } from "next/navigation";
 import toast from "react-hot-toast";
 import {
-  Search,
   Users,
-  Filter,
   Package,
   TrendingUp,
-  UserPlus,
   Edit3,
   Trash2,
   CalendarDays,
@@ -44,6 +41,7 @@ interface RawReport {
   mitra_id: string;
   qty: number;
   selling_price: number;
+  commission_rate: number;
 }
 interface RawInvItem {
   qty: number;
@@ -60,7 +58,6 @@ export default function MitraPage() {
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
   );
-
   const selectedYear = useMemo(
     () => Number(searchParams.get("year")) || new Date().getFullYear(),
     [searchParams],
@@ -125,7 +122,7 @@ export default function MitraPage() {
         .lte("created_at", end),
       supabase
         .from("partner_reports")
-        .select("mitra_id, qty, selling_price")
+        .select("mitra_id, qty, selling_price, commission_rate")
         .gte("created_at", start)
         .lte("created_at", end),
       supabase
@@ -143,9 +140,15 @@ export default function MitraPage() {
       const rawI = (iRes.data as unknown as RawInvItem[]) || [];
 
       const enriched: Mitra[] = rawM.map((m) => {
-        const belanjaBersih = rawT
+        const belanjaTunaiBulanIni = rawT
           .filter((t) => t.mitra_id === m.id)
           .reduce((a, c) => a + c.paid_amount, 0);
+        const pelunasanPiutangBulanIni = rawR
+          .filter((r) => r.mitra_id === m.id)
+          .reduce(
+            (a, c) => a + (c.selling_price - c.commission_rate) * c.qty,
+            0,
+          );
         const omzet = rawR
           .filter((r) => r.mitra_id === m.id)
           .reduce((a, c) => a + c.selling_price * c.qty, 0);
@@ -172,7 +175,7 @@ export default function MitraPage() {
 
         return {
           ...m,
-          belanjaPusat: belanjaBersih,
+          belanjaPusat: belanjaTunaiBulanIni + pelunasanPiutangBulanIni,
           penjualanKonsumen: omzet,
           belanjaKotorAkumulasi: totalKotorBulanIni,
           inventory: Object.entries(groupedStok).map(([name, val]) => ({
@@ -202,14 +205,13 @@ export default function MitraPage() {
     e.preventDefault();
     const payload = {
       full_name: form.name,
-      current_tier: form.tier, // Langsung ambil dari form tier, tidak dipaksa Reseller lagi
+      current_tier: form.tier,
       is_rp: form.is_rp,
     };
     const toastId = toast.loading("Processing...");
     const { error } = isEditing
       ? await supabase.from("mitra").update(payload).eq("id", form.id)
       : await supabase.from("mitra").insert([payload]);
-
     if (!error) {
       toast.success("Berhasil!", { id: toastId });
       setIsEditing(false);
@@ -239,7 +241,7 @@ export default function MitraPage() {
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sync Database Mitra...
+        Sync Database...
       </div>
     );
 
@@ -249,7 +251,7 @@ export default function MitraPage() {
         <div className="flex items-center gap-3">
           <Users size={36} className="text-green-900" />
           <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter">
-            Database Mitra & Analisis
+            Database Mitra
           </h1>
         </div>
         <div className="bg-blue-50 px-4 py-2 rounded-2xl border border-blue-100 flex items-center gap-2">
@@ -260,46 +262,37 @@ export default function MitraPage() {
         </div>
       </header>
 
-      {/* Form Pendaftaran */}
       <form
         onSubmit={handleSubmit}
         className="bg-white p-8 rounded-[35px] shadow-2xl mb-12 border border-gray-100"
       >
-        <h2 className="text-[10px] font-black text-gray-400 mb-6 uppercase tracking-[0.3em] flex items-center gap-2">
-          <UserPlus size={14} />{" "}
-          {isEditing ? "Edit Data Mitra" : "Daftarkan Mitra Baru"}
-        </h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
           <input
             placeholder="Nama Lengkap"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
             required
           />
-
           <select
             value={form.is_rp ? "RP" : "REGULER"}
             onChange={(e) => {
               const isRP = e.target.value === "RP";
-              // Perbaikan: Jika berubah ke RP, default ke Reseller, tapi dropdown tetap dibuka
               setForm({
                 ...form,
                 is_rp: isRP,
                 tier: isRP ? "Reseller" : form.tier,
               });
             }}
-            className="p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none"
           >
             <option value="REGULER">Mitra Reguler</option>
             <option value="RP">Rumah Perubahan (VIP)</option>
           </select>
-
-          {/* Dropdown Tier: Sekarang selalu dibuka (tidak disabled) */}
           <select
             value={form.tier}
             onChange={(e) => setForm({ ...form, tier: e.target.value })}
-            className={`p-4 border rounded-2xl font-bold outline-none focus:ring-2 ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700 focus:ring-blue-500" : "bg-gray-50 border-gray-200 focus:ring-green-500"}`}
+            className={`p-4 border rounded-2xl font-bold outline-none focus:ring-2 ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-gray-50 border-gray-200"}`}
           >
             <option value="Member">Member</option>
             <option value="Reseller">Reseller</option>
@@ -309,44 +302,31 @@ export default function MitraPage() {
           </select>
         </div>
         <button
-          className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs transition-all ${isEditing ? "bg-orange-500 hover:bg-orange-600" : "bg-green-800 hover:bg-green-900"}`}
+          className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs transition-all ${isEditing ? "bg-orange-500" : "bg-green-800"}`}
         >
           {isEditing ? "Update Data Mitra" : "Daftarkan Sekarang"}
         </button>
       </form>
 
-      {/* Search & Table tetap sama */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-        <div className="md:col-span-2 relative">
-          <Search
-            className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-300"
-            size={18}
-          />
-          <input
-            placeholder="Cari nama mitra..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
-          />
-        </div>
-        <div className="relative">
-          <Filter
-            className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-300"
-            size={18}
-          />
-          <select
-            value={tierFilter}
-            onChange={(e) => setTierFilter(e.target.value)}
-            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold appearance-none outline-none focus:ring-2 focus:ring-green-500"
-          >
-            <option value="All">Semua Tier</option>
-            <option value="Member">Member</option>
-            <option value="Reseller">Reseller</option>
-            <option value="Sub-Agen">Sub-Agen</option>
-            <option value="Agen">Agen</option>
-            <option value="Distributor">Distributor</option>
-          </select>
-        </div>
+        <input
+          placeholder="Cari nama mitra..."
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          className="md:col-span-2 p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+        />
+        <select
+          value={tierFilter}
+          onChange={(e) => setTierFilter(e.target.value)}
+          className="p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+        >
+          <option value="All">Semua Tier</option>
+          <option value="Member">Member</option>
+          <option value="Reseller">Reseller</option>
+          <option value="Sub-Agen">Sub-Agen</option>
+          <option value="Agen">Agen</option>
+          <option value="Distributor">Distributor</option>
+        </select>
       </div>
 
       <div className="bg-white rounded-[40px] shadow-sm overflow-hidden border border-gray-100">
@@ -359,8 +339,8 @@ export default function MitraPage() {
               <th className="p-8 text-right bg-orange-50/20 border-r">
                 TOTAL BRUTO
               </th>
-              <th className="p-8 text-right bg-green-50/20 border-r">
-                TERBAYAR
+              <th className="p-8 text-right bg-green-900/10 border-r">
+                NETTO KE PUSAT
               </th>
               <th className="p-8 text-right bg-blue-50/10 border-r">OMZET</th>
               <th className="p-8 text-center">AKSI</th>
@@ -381,7 +361,7 @@ export default function MitraPage() {
                       </span>
                     )}
                   </div>
-                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2 tracking-widest shadow-sm">
+                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2 shadow-sm">
                     {m.current_tier}
                   </span>
                 </td>
@@ -405,7 +385,7 @@ export default function MitraPage() {
                 <td className="p-8 text-right font-mono font-black text-orange-600 italic text-lg border-r bg-orange-50/10">
                   Rp {m.belanjaKotorAkumulasi.toLocaleString("id-ID")}
                 </td>
-                <td className="p-8 text-right font-mono font-black text-green-700 italic text-lg border-r bg-green-50/10">
+                <td className="p-8 text-right font-mono font-black text-green-900 italic text-lg border-r bg-green-100/10">
                   Rp {m.belanjaPusat.toLocaleString("id-ID")}
                 </td>
                 <td className="p-8 text-right font-mono font-black text-blue-700 italic text-lg bg-blue-50/5 border-r">

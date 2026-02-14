@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
 import { useSearchParams } from "next/navigation";
-import { ClipboardList, CalendarDays, Calendar } from "lucide-react";
+import { ClipboardList, CalendarDays, Calendar, Trash2 } from "lucide-react";
 import toast from "react-hot-toast";
 
 interface Mitra {
@@ -19,9 +19,11 @@ interface PartnerReport {
   id: string;
   qty: number;
   selling_price: number;
-  base_price_at_time: number; // Tambahkan untuk audit
-  commission_rate: number; // Selisih untung per botol
+  base_price_at_time: number;
+  commission_rate: number;
   created_at: string;
+  mitra_id: string;
+  product_id: string;
   mitra: { full_name: string; current_tier: string } | null;
   product: { name: string } | null;
 }
@@ -89,21 +91,19 @@ export default function LaporanPenjualanMitra() {
     }
   }, [selectedMonth, selectedYear]);
 
-  // FIX: Fungsi pendeteksi tier historis berdasarkan harga modal barang yang dijual
   const getHistoricalTierLabel = (r: PartnerReport) => {
     if (!r.base_price_at_time || r.base_price_at_time === 0)
       return r.mitra?.current_tier || "Member";
 
-    // Hitung modal per item (Selling Price - Profit = Modal)
     const modalPerItem = r.selling_price - r.commission_rate;
     const discountPercent = Math.round(
       (1 - modalPerItem / r.base_price_at_time) * 100,
     );
 
-    if (discountPercent >= 44) return "Distributor"; // 45%
-    if (discountPercent >= 34) return "Agen"; // 35%
-    if (discountPercent >= 24) return "Sub-Agen"; // 25%
-    if (discountPercent >= 14) return "Reseller"; // 15%
+    if (discountPercent >= 44) return "Distributor";
+    if (discountPercent >= 34) return "Agen";
+    if (discountPercent >= 24) return "Sub-Agen";
+    if (discountPercent >= 14) return "Reseller";
     return "Member";
   };
 
@@ -130,7 +130,7 @@ export default function LaporanPenjualanMitra() {
     const { data } = await supabase
       .from("partner_reports")
       .select(
-        `id, qty, selling_price, base_price_at_time, commission_rate, created_at, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
+        `id, qty, selling_price, base_price_at_time, commission_rate, created_at, mitra_id, product_id, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
       )
       .gte("created_at", start)
       .lte("created_at", end)
@@ -141,7 +141,7 @@ export default function LaporanPenjualanMitra() {
 
   useEffect(() => {
     let isMounted = true;
-    async function init() {
+    (async () => {
       const [m, p] = await Promise.all([
         supabase.from("mitra").select("*").order("full_name"),
         supabase.from("products").select("*").order("name"),
@@ -152,12 +152,83 @@ export default function LaporanPenjualanMitra() {
         await fetchReports();
         setLoading(false);
       }
-    }
-    init();
+    })();
     return () => {
       isMounted = false;
     };
   }, [supabase, fetchReports]);
+
+  const handleDeleteReport = async (report: PartnerReport) => {
+    if (
+      !confirm(
+        "Hapus laporan jualan ini? Sisa stok di mitra akan dikembalikan & piutang ke pusat akan dimunculkan kembali.",
+      )
+    )
+      return;
+    const toastId = toast.loading(
+      "Membatalkan laporan & mengembalikan stok...",
+    );
+
+    try {
+      const modalValuePerItem = report.selling_price - report.commission_rate;
+      const totalModalToRestore = report.qty * modalValuePerItem;
+
+      const { data: lastBatch } = await supabase
+        .from("transaction_items")
+        .select(
+          `
+          id, 
+          transaction_id, 
+          remaining_qty_at_partner, 
+          transactions!inner(id, total_amount, paid_amount)
+        `,
+        )
+        .eq("product_id", report.product_id)
+        .eq("transactions.mitra_id", report.mitra_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .single();
+
+      if (lastBatch) {
+        await supabase
+          .from("transaction_items")
+          .update({
+            remaining_qty_at_partner:
+              (lastBatch.remaining_qty_at_partner || 0) + report.qty,
+          })
+          .eq("id", lastBatch.id);
+
+        const tx = lastBatch.transactions as unknown as {
+          id: string;
+          total_amount: number;
+          paid_amount: number;
+        };
+        const newTotal = tx.total_amount + totalModalToRestore;
+        const newPaid = Math.max(0, tx.paid_amount - totalModalToRestore);
+
+        await supabase
+          .from("transactions")
+          .update({
+            total_amount: Math.round(newTotal),
+            paid_amount: Math.round(newPaid),
+            payment_status: "Unpaid",
+          })
+          .eq("id", lastBatch.transaction_id);
+      }
+
+      const { error: deleteError } = await supabase
+        .from("partner_reports")
+        .delete()
+        .eq("id", report.id);
+      if (deleteError) throw deleteError;
+
+      toast.success("Laporan berhasil dibatalkan!", { id: toastId });
+      await fetchReports();
+    } catch (err) {
+      console.error("Delete Error:", err);
+      toast.error("Gagal menghapus data!", { id: toastId });
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -292,7 +363,7 @@ export default function LaporanPenjualanMitra() {
       >
         <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-end">
           <div className="md:col-span-3 bg-orange-50/50 p-3 rounded-2xl border border-orange-100">
-            <label className="text-[10px] font-black uppercase text-orange-600 mb-1 block ml-1 flex items-center gap-1">
+            <label className="text-[10px] font-black uppercase text-orange-600 mb-1 block flex items-center gap-1">
               <Calendar size={12} /> Tanggal Jualan
             </label>
             <input
@@ -359,7 +430,6 @@ export default function LaporanPenjualanMitra() {
                 setTotalOmzetInput(Number(e.target.value.replace(/\D/g, "")))
               }
               className="w-full p-4 bg-gray-50 border rounded-2xl font-bold"
-              placeholder="Total Duit..."
             />
           </div>
         </div>
@@ -375,18 +445,21 @@ export default function LaporanPenjualanMitra() {
         <table className="w-full text-left">
           <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase border-b">
             <tr>
-              <th className="p-8">No</th>
+              <th className="p-8 w-16 text-center border-r">No</th>
               <th className="p-8">Waktu Jualan</th>
               <th className="p-8">Mitra</th>
               <th className="p-8 text-center">Qty</th>
               <th className="p-8 text-right">Total Penjualan</th>
+              <th className="p-8 text-center">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
             {reports.length > 0 ? (
               reports.map((r, idx) => (
                 <tr key={r.id} className="hover:bg-gray-50/50 transition-all">
-                  <td className="p-8 text-gray-300 font-bold">{idx + 1}</td>
+                  <td className="p-8 text-gray-300 font-bold text-center border-r">
+                    {idx + 1}
+                  </td>
                   <td className="p-8 font-mono text-[10px] text-gray-400">
                     {new Date(r.created_at).toLocaleDateString("id-ID")}
                   </td>
@@ -394,7 +467,6 @@ export default function LaporanPenjualanMitra() {
                     <div className="font-bold text-gray-800 uppercase">
                       {r.mitra?.full_name}
                     </div>
-                    {/* FIX: Tampilkan Label Tier Historis */}
                     <div className="text-[9px] font-black uppercase text-green-600">
                       {getHistoricalTierLabel(r)}
                     </div>
@@ -405,15 +477,23 @@ export default function LaporanPenjualanMitra() {
                   <td className="p-8 text-right font-black text-green-700">
                     Rp {(r.selling_price * r.qty).toLocaleString("id-ID")}
                   </td>
+                  <td className="p-8 text-center">
+                    <button
+                      onClick={() => handleDeleteReport(r)}
+                      className="p-3 bg-red-50 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all shadow-sm"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </td>
                 </tr>
               ))
             ) : (
               <tr>
                 <td
-                  colSpan={5}
+                  colSpan={6}
                   className="p-20 text-center text-gray-300 italic font-bold uppercase tracking-widest"
                 >
-                  Tidak ada laporan jualan di periode ini
+                  Tidak ada laporan jualan
                 </td>
               </tr>
             )}
