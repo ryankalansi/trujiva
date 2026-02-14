@@ -24,7 +24,8 @@ interface Transaction {
     qty: number;
     product_id: string;
     remaining_qty_at_partner: number;
-    product: { name: string } | null;
+    price_at_time: number;
+    product: { name: string; base_price: number } | null;
   }[];
 }
 
@@ -62,6 +63,25 @@ export default function ArusKasPusatPage() {
     "Desember",
   ];
 
+  // FIX: Fungsi untuk mendeteksi Tier secara historis berdasarkan harga jual saat itu
+  const getHistoricalTier = (t: Transaction) => {
+    const firstItem = t.transaction_items[0];
+    if (!firstItem || !firstItem.product)
+      return t.mitra?.current_tier || "Member";
+
+    const basePrice = firstItem.product.base_price;
+    const soldPrice = firstItem.price_at_time;
+
+    // Hitung persentase diskon yang diberikan saat transaksi
+    const discountPercent = Math.round((1 - soldPrice / basePrice) * 100);
+
+    if (discountPercent >= 44) return "Distributor"; // Diskon 45%
+    if (discountPercent >= 34) return "Agen"; // Diskon 35%
+    if (discountPercent >= 24) return "Sub-Agen"; // Diskon 25%
+    if (discountPercent >= 14) return "Reseller"; // Diskon 15%
+    return "Member";
+  };
+
   const loadHistory = useCallback(async () => {
     setLoading(true);
     const startOfMonth = new Date(
@@ -89,7 +109,7 @@ export default function ArusKasPusatPage() {
         `
         id, created_at, total_amount, paid_amount, payment_status, payment_method, mitra_id,
         mitra:mitra_id (full_name, current_tier),
-        transaction_items (qty, product_id, remaining_qty_at_partner, product:product_id (name))
+        transaction_items (qty, product_id, remaining_qty_at_partner, price_at_time, product:product_id (name, base_price))
       `,
       )
       .eq("is_sample", false)
@@ -116,68 +136,50 @@ export default function ArusKasPusatPage() {
       !confirm("Hapus transaksi ini? Stok gudang akan otomatis dikembalikan.")
     )
       return;
-
     const toastId = toast.loading("Mengembalikan stok & menghapus data...");
 
     try {
-      // 1. Ambil data item transaksi untuk proses restore stok
-      const { data: items, error: fetchError } = await supabase
+      const { data: items } = await supabase
         .from("transaction_items")
         .select("qty, product_id")
         .eq("transaction_id", id);
-
-      if (fetchError) throw fetchError;
-
-      // 2. Kembalikan stok ke tabel products
-      if (items && items.length > 0) {
+      if (items) {
         for (const item of items) {
-          const { data: productData } = await supabase
+          const { data: p } = await supabase
             .from("products")
             .select("stock")
             .eq("id", item.product_id)
             .single();
-
-          if (productData) {
+          if (p)
             await supabase
               .from("products")
-              .update({ stock: productData.stock + item.qty })
+              .update({ stock: p.stock + item.qty })
               .eq("id", item.product_id);
-          }
         }
       }
-
-      // 3. Hapus transaksi utama (Cascade delete akan hapus transaction_items otomatis)
-      const { error: deleteError } = await supabase
-        .from("transactions")
-        .delete()
-        .eq("id", id);
-
-      if (deleteError) throw deleteError;
-
-      toast.success("Berhasil! Stok kembali & transaksi dihapus.", {
-        id: toastId,
-      });
+      await supabase.from("transactions").delete().eq("id", id);
+      toast.success("Berhasil dihapus!", { id: toastId });
       loadHistory();
     } catch (err) {
       console.error(err);
-      toast.error("Gagal sinkronisasi data!", { id: toastId });
+      toast.error("Gagal sinkronisasi!", { id: toastId });
     }
   };
 
   const filteredData = useMemo(() => {
     return transactions.filter((t) => {
       const name = t.mitra?.full_name || "";
-      const matchSearch = name.toLowerCase().includes(searchTerm.toLowerCase());
-      const matchStatus =
-        statusFilter === "All" || t.payment_status === statusFilter;
-      return matchSearch && matchStatus;
+      return (
+        name.toLowerCase().includes(searchTerm.toLowerCase()) &&
+        (statusFilter === "All" || t.payment_status === statusFilter)
+      );
     });
   }, [transactions, searchTerm, statusFilter]);
 
   if (loading)
     return (
       <div className="p-8 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sync Arus Kas {months[selectedMonth - 1]}...
+        Sync Arus Kas...
       </div>
     );
 
@@ -205,11 +207,10 @@ export default function ArusKasPusatPage() {
             size={18}
           />
           <input
-            type="text"
             placeholder="Cari nama mitra..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm outline-none focus:ring-2 focus:ring-green-500 font-bold"
+            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
           />
         </div>
         <div className="relative">
@@ -220,7 +221,7 @@ export default function ArusKasPusatPage() {
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
-            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none cursor-pointer focus:ring-2 focus:ring-green-500 appearance-none"
+            className="w-full p-4 pl-12 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none appearance-none cursor-pointer"
           >
             <option value="All">Semua Status</option>
             <option value="Unpaid">Piutang</option>
@@ -233,9 +234,7 @@ export default function ArusKasPusatPage() {
         <table className="w-full text-left">
           <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
             <tr>
-              <th className="p-8 border-r text-center w-16 font-black uppercase tracking-widest">
-                No
-              </th>
+              <th className="p-8 border-r text-center w-16">No</th>
               <th className="p-8">Waktu & Mitra</th>
               <th className="p-8">Stok Aktif</th>
               <th className="p-8 text-right bg-green-50/20 border-r">
@@ -260,10 +259,11 @@ export default function ArusKasPusatPage() {
                       {t.mitra?.full_name}
                     </div>
                     <div className="flex gap-2 mt-2 items-center">
-                      <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg">
-                        {t.mitra?.current_tier}
+                      {/* FIX: Menggunakan label tier historis */}
+                      <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg shadow-sm">
+                        {getHistoricalTier(t)}
                       </span>
-                      <span className="text-[9px] font-black uppercase bg-green-50 text-green-700 px-2 py-0.5 rounded-lg border border-green-100 tracking-tighter px-2 whitespace-nowrap">
+                      <span className="text-[9px] font-black uppercase bg-green-50 text-green-700 px-2 py-0.5 rounded-lg border border-green-100">
                         {t.payment_method}
                       </span>
                     </div>
@@ -294,7 +294,7 @@ export default function ArusKasPusatPage() {
                       </span>
                       <button
                         onClick={() => handleDelete(t.id)}
-                        className="p-3 bg-red-50 text-red-500 rounded-2xl hover:bg-red-500 hover:text-white transition-all border border-red-100 shadow-sm"
+                        className="p-3 bg-red-50 text-red-500 rounded-2xl hover:bg-red-500 hover:text-white transition-all shadow-sm"
                       >
                         <Trash2 size={16} />
                       </button>

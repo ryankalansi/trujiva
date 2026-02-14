@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
-import { useRouter, useSearchParams } from "next/navigation"; // Tambahkan useSearchParams
+import { useRouter, useSearchParams } from "next/navigation";
 import toast from "react-hot-toast";
 import { Calendar, History } from "lucide-react";
 
@@ -24,7 +24,6 @@ export default function TransaksiPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  // --- 1. LOGIKA PERIODE GLOBAL ---
   const selectedMonth = useMemo(
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
@@ -37,21 +36,16 @@ export default function TransaksiPage() {
 
   const [products, setProducts] = useState<Product[]>([]);
   const [mitra, setMitra] = useState<Mitra[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(true); // Digunakan untuk indikator awal
   const [selectedMitra, setSelectedMitra] = useState("");
   const [selectedProduct, setSelectedProduct] = useState("");
   const [qty, setQty] = useState(1);
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("QRIS");
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  // --- 2. SINKRONISASI TANGGAL DEFAULT ---
-  // Kita set default tanggal ke tanggal 1 di bulan yang dipilih di Dashboard
   const [transactionDate, setTransactionDate] = useState("");
 
   useEffect(() => {
     const monthStr = String(selectedMonth).padStart(2, "0");
-    // Jika bulan yang dipilih adalah bulan sekarang, pakai tanggal hari ini.
-    // Jika bukan, pakai tanggal 1 di bulan tersebut.
     const today = new Date();
     if (
       selectedMonth === today.getMonth() + 1 &&
@@ -70,16 +64,14 @@ export default function TransaksiPage() {
         .select("*")
         .eq("is_active", true)
         .order("name");
-
       const { data: m } = await supabase
         .from("mitra")
         .select("*")
         .order("full_name");
-
       if (p) setProducts(p as Product[]);
       if (m) setMitra(m as Mitra[]);
     } finally {
-      setLoading(false);
+      setLoading(false); // Dipakai di sini
     }
   }, [supabase]);
 
@@ -109,17 +101,33 @@ export default function TransaksiPage() {
         history?.reduce((acc, curr) => acc + curr.qty, 0) || 0;
       const totalAkumulasiBruto = (totalQtyLama + qty) * product.base_price;
 
-      let newTier = mTerpilih.current_tier;
-      if (totalAkumulasiBruto >= 100000000) newTier = "Distributor";
-      else if (totalAkumulasiBruto >= 25000000) newTier = "Agen";
-      else if (totalAkumulasiBruto >= 5000000) newTier = "Sub-Agen";
-      else if (totalAkumulasiBruto >= 500000) newTier = "Reseller";
-      if (mTerpilih.is_rp && newTier === "Member") newTier = "Reseller";
+      const tierRank: Record<string, number> = {
+        "Member": 0,
+        "Reseller": 1,
+        "Sub-Agen": 2,
+        "Agen": 3,
+        "Distributor": 4,
+      };
 
-      await supabase
-        .from("mitra")
-        .update({ current_tier: newTier })
-        .eq("id", selectedMitra);
+      let calculatedTier = "Member";
+      if (totalAkumulasiBruto >= 100000000) calculatedTier = "Distributor";
+      else if (totalAkumulasiBruto >= 25000000) calculatedTier = "Agen";
+      else if (totalAkumulasiBruto >= 5000000) calculatedTier = "Sub-Agen";
+      else if (totalAkumulasiBruto >= 500000) calculatedTier = "Reseller";
+
+      // FIX ESLint: Gunakan const untuk finalTier
+      const currentTierAtDatabase = mTerpilih.current_tier;
+      const finalTier =
+        tierRank[calculatedTier] > tierRank[currentTierAtDatabase]
+          ? calculatedTier
+          : currentTierAtDatabase;
+
+      if (finalTier !== currentTierAtDatabase) {
+        await supabase
+          .from("mitra")
+          .update({ current_tier: finalTier })
+          .eq("id", selectedMitra);
+      }
 
       const rates: Record<string, number> = {
         "Member": 0,
@@ -128,7 +136,9 @@ export default function TransaksiPage() {
         "Agen": 0.35,
         "Distributor": 0.45,
       };
-      const netAmount = qty * product.base_price * (1 - rates[newTier]);
+
+      const discountRate = rates[finalTier] || 0;
+      const netAmount = qty * product.base_price * (1 - discountRate);
       const isPiutang = paymentMethod === "Piutang";
 
       const { data: trans, error: transError } = await supabase
@@ -156,7 +166,7 @@ export default function TransaksiPage() {
           product_id: selectedProduct,
           qty,
           remaining_qty_at_partner: qty,
-          price_at_time: product.base_price * (1 - rates[newTier]),
+          price_at_time: product.base_price * (1 - discountRate),
         },
       ]);
 
@@ -165,25 +175,28 @@ export default function TransaksiPage() {
         .update({ stock: product.stock - qty })
         .eq("id", product.id);
 
-      toast.success(`${mTerpilih.full_name} sah jadi ${newTier}!`, {
-        id: toastId,
-      });
+      toast.success(
+        `${mTerpilih.full_name} (${finalTier}) berhasil diproses!`,
+        { id: toastId },
+      );
       router.refresh();
       await fetchData();
       setSelectedMitra("");
       setSelectedProduct("");
       setQty(1);
-    } catch {
+    } catch (err) {
+      console.error(err);
       toast.error("Transaksi gagal!", { id: toastId });
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  // FIX ESLint: Gunakan variabel loading untuk tampilan agar tidak 'Unused'
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sync Data...
+        Sync Data Transaksi...
       </div>
     );
 
@@ -208,7 +221,6 @@ export default function TransaksiPage() {
         <h1 className="text-3xl font-black text-green-900 italic uppercase tracking-tighter">
           Input Pemesanan Mitra
         </h1>
-        {/* Indikator agar admin tidak salah input bulan */}
         <div className="mt-2 flex justify-center">
           <div className="bg-orange-50 px-4 py-1.5 rounded-full border border-orange-100 flex items-center gap-2">
             <History size={12} className="text-orange-600" />
@@ -231,7 +243,6 @@ export default function TransaksiPage() {
             type="date"
             value={transactionDate}
             onChange={(e) => setTransactionDate(e.target.value)}
-            // Membatasi input agar hanya bisa di bulan yang dipilih
             min={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-01`}
             max={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-${new Date(selectedYear, selectedMonth, 0).getDate()}`}
             className="w-full p-3 bg-white border border-orange-200 rounded-xl font-bold text-orange-900 outline-none focus:ring-2 focus:ring-orange-500 cursor-pointer"
