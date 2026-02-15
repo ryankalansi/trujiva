@@ -12,6 +12,7 @@ import {
   CalendarDays,
 } from "lucide-react";
 
+// --- Interface Definisi ---
 interface InventoryItem {
   name: string;
   rem: number;
@@ -22,10 +23,10 @@ interface Mitra {
   full_name: string;
   current_tier: string;
   is_rp: boolean;
-  belanjaPusat: number;
+  belanjaPusat: number; // NETTO (Total uang masuk ke pusat)
   penjualanKonsumen: number;
-  belanjaKotorAkumulasi: number;
-  valueProdukMitra: number; // Kolom baru untuk balance
+  belanjaKotorAkumulasi: number; // BRUTO (Akumulasi harga jual dasar)
+  valueProdukMitra: number; // VALUE (Akumulasi harga aset setelah diskon)
   inventory: InventoryItem[];
 }
 interface RawMitra {
@@ -33,10 +34,6 @@ interface RawMitra {
   full_name: string;
   current_tier: string;
   is_rp: boolean;
-}
-interface RawTransaction {
-  mitra_id: string;
-  paid_amount: number;
 }
 interface RawReport {
   mitra_id: string;
@@ -47,8 +44,17 @@ interface RawReport {
 interface RawInvItem {
   qty: number;
   remaining_qty_at_partner: number;
+  price_at_time: number;
   product: { name: string; base_price: number } | null;
-  transactions: { mitra_id: string; created_at: string } | null;
+  transactions: {
+    id: string;
+    mitra_id: string;
+    created_at: string;
+    paid_amount: number;
+  } | null;
+}
+interface StokAcc {
+  [key: string]: { rem: number; tot: number };
 }
 
 export default function MitraPage() {
@@ -114,13 +120,8 @@ export default function MitraPage() {
       999,
     ).toISOString();
 
-    const [mRes, tRes, rRes, iRes] = await Promise.all([
+    const [mRes, rRes, iRes] = await Promise.all([
       supabase.from("mitra").select("*").order("full_name"),
-      supabase
-        .from("transactions")
-        .select("mitra_id, paid_amount")
-        .gte("created_at", start)
-        .lte("created_at", end),
       supabase
         .from("partner_reports")
         .select("mitra_id, qty, selling_price, commission_rate")
@@ -129,71 +130,58 @@ export default function MitraPage() {
       supabase
         .from("transaction_items")
         .select(
-          `qty, remaining_qty_at_partner, product:product_id(name, base_price), transactions!inner(mitra_id, created_at)`,
+          `qty, remaining_qty_at_partner, price_at_time, product:product_id(name, base_price), transactions!inner(id, mitra_id, created_at, paid_amount)`,
         )
         .lte("transactions.created_at", end),
     ]);
 
     if (mRes.data) {
       const rawM = mRes.data as RawMitra[];
-      const rawT = (tRes.data as unknown as RawTransaction[]) || [];
       const rawR = (rRes.data as unknown as RawReport[]) || [];
       const rawI = (iRes.data as unknown as RawInvItem[]) || [];
 
-      // Mapping Rate Diskon
-      const rates: Record<string, number> = {
-        "Member": 0,
-        "Reseller": 0.15,
-        "Sub-Agen": 0.25,
-        "Agen": 0.35,
-        "Distributor": 0.45,
-      };
-
       const enriched: Mitra[] = rawM.map((m) => {
-        const belanjaTunaiBulanIni = rawT
-          .filter((t) => t.mitra_id === m.id)
-          .reduce((a, c) => a + c.paid_amount, 0);
-        const pelunasanPiutangBulanIni = rawR
-          .filter((r) => r.mitra_id === m.id)
-          .reduce(
-            (a, c) => a + (c.selling_price - c.commission_rate) * c.qty,
-            0,
-          );
-        const omzet = rawR
+        const myInv = rawI.filter((inv) => inv.transactions?.mitra_id === m.id);
+
+        // 1. TOTAL BRUTO (AKUMULASI): Seluruh qty belanja * harga dasar produk
+        const totalBrutoAkumulasi = myInv.reduce((acc, curr) => {
+          return acc + curr.qty * (curr.product?.base_price || 0);
+        }, 0);
+
+        // 2. VALUE PRODUK MITRA (AKUMULASI): Seluruh qty belanja * harga setelah diskon tier
+        // Ini tidak berkurang saat jualan, melainkan bertambah terus saat ada pemesanan baru.
+        const totalValueAkumulasi = myInv.reduce((acc, curr) => {
+          return acc + curr.qty * (curr.price_at_time || 0);
+        }, 0);
+
+        // 3. NETTO KE PUSAT: Total uang tunai yang sudah diterima pusat dari mitra ini
+        const totalNettoTerbayar = myInv.reduce((acc, curr) => {
+          // Menghitung paid_amount unik per ID transaksi agar tidak double-count jika satu transaksi berisi banyak item
+          const isUnique =
+            myInv.findIndex(
+              (i) => i.transactions?.id === curr.transactions?.id,
+            ) === myInv.indexOf(curr);
+          return acc + (isUnique ? curr.transactions?.paid_amount || 0 : 0);
+        }, 0);
+
+        const totalOmzetUser = rawR
           .filter((r) => r.mitra_id === m.id)
           .reduce((a, c) => a + c.selling_price * c.qty, 0);
 
-        const myInv = rawI.filter((inv) => inv.transactions?.mitra_id === m.id);
-        const totalBrutoBulanIni = myInv
-          .filter(
-            (inv) => inv.transactions && inv.transactions.created_at >= start,
-          )
-          .reduce(
-            (acc, curr) => acc + curr.qty * (curr.product?.base_price || 0),
-            0,
-          );
-
-        // Hitung Value Produk (Bruto - Diskon Tier)
-        const discountRate = rates[m.current_tier] || 0;
-        const valueBersihBulanIni = totalBrutoBulanIni * (1 - discountRate);
-
-        const groupedStok = myInv.reduce(
-          (acc: Record<string, { rem: number; tot: number }>, curr) => {
-            const name = curr.product?.name || "Produk";
-            if (!acc[name]) acc[name] = { rem: 0, tot: 0 };
-            acc[name].rem += curr.remaining_qty_at_partner;
-            acc[name].tot += curr.qty;
-            return acc;
-          },
-          {},
-        );
+        const groupedStok = myInv.reduce((acc: StokAcc, curr) => {
+          const name = curr.product?.name || "Produk";
+          if (!acc[name]) acc[name] = { rem: 0, tot: 0 };
+          acc[name].rem += curr.remaining_qty_at_partner || 0;
+          acc[name].tot += curr.qty;
+          return acc;
+        }, {});
 
         return {
           ...m,
-          belanjaPusat: belanjaTunaiBulanIni + pelunasanPiutangBulanIni, // NETTO KE PUSAT
-          penjualanKonsumen: omzet,
-          belanjaKotorAkumulasi: totalBrutoBulanIni, // TOTAL BRUTO
-          valueProdukMitra: valueBersihBulanIni, // VALUE PRODUK MITRA
+          belanjaPusat: totalNettoTerbayar,
+          penjualanKonsumen: totalOmzetUser,
+          belanjaKotorAkumulasi: totalBrutoAkumulasi,
+          valueProdukMitra: totalValueAkumulasi,
           inventory: Object.entries(groupedStok).map(([name, val]) => ({
             name,
             rem: val.rem,
@@ -201,17 +189,17 @@ export default function MitraPage() {
           })),
         };
       });
-
       setMitraList(enriched);
-      setLoading(false);
     }
+    setLoading(false);
   }, [supabase, selectedMonth, selectedYear]);
 
   useEffect(() => {
     let isMounted = true;
-    (async () => {
+    const initLoad = async () => {
       if (isMounted) await fetchData();
-    })();
+    };
+    initLoad();
     return () => {
       isMounted = false;
     };
@@ -236,22 +224,12 @@ export default function MitraPage() {
     } else toast.error("Gagal!", { id: toastId });
   };
 
-  const handleDelete = async (id: string) => {
-    if (confirm("Hapus mitra?")) {
-      await supabase.from("mitra").delete().eq("id", id);
-      toast.success("Dihapus!");
-      setRefreshKey((p) => p + 1);
-    }
-  };
-
   const filtered = useMemo(() => {
-    return mitraList.filter((m) => {
-      const matchSearch = m.full_name
-        .toLowerCase()
-        .includes(searchTerm.toLowerCase());
-      const matchTier = tierFilter === "All" || m.current_tier === tierFilter;
-      return matchSearch && matchTier;
-    });
+    return mitraList.filter(
+      (m) =>
+        m.full_name.toLowerCase().includes(searchTerm.toLowerCase()) &&
+        (tierFilter === "All" || m.current_tier === tierFilter),
+    );
   }, [mitraList, searchTerm, tierFilter]);
 
   if (loading)
@@ -270,24 +248,24 @@ export default function MitraPage() {
             Database Mitra
           </h1>
         </div>
-        <div className="bg-blue-50 px-4 py-2 rounded-2xl border border-blue-100 flex items-center gap-2">
-          <CalendarDays size={16} className="text-blue-600" />
+        <div className="bg-blue-50 px-4 py-2 rounded-2xl border flex items-center gap-2">
+          <CalendarDays size={16} />
           <span className="text-[10px] font-black uppercase text-blue-600 tracking-widest">
-            Periode Analisis: {months[selectedMonth - 1]} {selectedYear}
+            Periode: {months[selectedMonth - 1]} {selectedYear}
           </span>
         </div>
       </header>
 
       <form
         onSubmit={handleSubmit}
-        className="bg-white p-8 rounded-[35px] shadow-2xl mb-12 border border-gray-100"
+        className="bg-white p-8 rounded-[35px] shadow-2xl mb-12 border"
       >
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
           <input
             placeholder="Nama Lengkap"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none"
             required
           />
           <select
@@ -300,7 +278,7 @@ export default function MitraPage() {
                 tier: isRP ? "Reseller" : form.tier,
               });
             }}
-            className="p-4 bg-gray-50 border rounded-2xl font-bold"
+            className="p-4 bg-gray-50 border rounded-2xl font-bold outline-none"
           >
             <option value="REGULER">Mitra Reguler</option>
             <option value="RP">Rumah Perubahan (VIP)</option>
@@ -308,7 +286,7 @@ export default function MitraPage() {
           <select
             value={form.tier}
             onChange={(e) => setForm({ ...form, tier: e.target.value })}
-            className={`p-4 border rounded-2xl font-bold outline-none ${form.is_rp ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-gray-50 border-gray-200"}`}
+            className={`p-4 border rounded-2xl font-bold outline-none ${form.is_rp ? "bg-blue-50 text-blue-700" : "bg-gray-50"}`}
           >
             <option value="Member">Member</option>
             <option value="Reseller">Reseller</option>
@@ -318,7 +296,8 @@ export default function MitraPage() {
           </select>
         </div>
         <button
-          className={`w-full p-5 rounded-2xl font-black text-white shadow-lg uppercase tracking-widest text-xs transition-all ${isEditing ? "bg-orange-500" : "bg-green-800"}`}
+          type="submit"
+          className="w-full p-5 rounded-2xl font-black text-white bg-green-800 uppercase tracking-widest text-xs transition-all"
         >
           {isEditing ? "Update Data" : "Daftarkan Sekarang"}
         </button>
@@ -329,12 +308,12 @@ export default function MitraPage() {
           placeholder="Cari nama mitra..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          className="md:col-span-2 p-4 bg-white border rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+          className="md:col-span-2 p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
         />
         <select
           value={tierFilter}
           onChange={(e) => setTierFilter(e.target.value)}
-          className="p-4 bg-white border rounded-2xl shadow-sm font-bold outline-none focus:ring-2 focus:ring-green-500"
+          className="p-4 bg-white border border-gray-100 rounded-2xl shadow-sm font-bold outline-none cursor-pointer focus:ring-2 focus:ring-green-500"
         >
           <option value="All">Semua Tier</option>
           <option value="Member">Member</option>
@@ -345,7 +324,7 @@ export default function MitraPage() {
         </select>
       </div>
 
-      <div className="bg-white rounded-[40px] shadow-sm overflow-hidden border border-gray-100">
+      <div className="bg-white rounded-[40px] shadow-sm overflow-hidden border">
         <table className="w-full text-left">
           <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
             <tr>
@@ -380,7 +359,7 @@ export default function MitraPage() {
                       </span>
                     )}
                   </div>
-                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2">
+                  <span className="text-[9px] font-black bg-blue-600 text-white px-2 py-0.5 rounded-lg inline-block mt-2 shadow-sm">
                     {m.current_tier}
                   </span>
                 </td>
@@ -430,13 +409,20 @@ export default function MitraPage() {
                         setIsEditing(true);
                         window.scrollTo({ top: 0, behavior: "smooth" });
                       }}
-                      className="p-3 bg-orange-50 text-orange-500 rounded-xl hover:bg-orange-500 hover:text-white transition-all"
+                      className="p-3 bg-orange-50 text-orange-500 rounded-xl hover:bg-orange-500 hover:text-white transition-all shadow-sm"
                     >
                       <Edit3 size={16} />
                     </button>
                     <button
-                      onClick={() => handleDelete(m.id)}
-                      className="p-3 bg-red-50 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all"
+                      onClick={() => {
+                        if (confirm("Hapus?"))
+                          supabase
+                            .from("mitra")
+                            .delete()
+                            .eq("id", m.id)
+                            .then(() => fetchData());
+                      }}
+                      className="p-3 bg-red-50 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all shadow-sm"
                     >
                       <Trash2 size={16} />
                     </button>

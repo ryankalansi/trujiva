@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { ClipboardList, CalendarDays, Calendar, Trash2 } from "lucide-react";
 import toast from "react-hot-toast";
 
+// --- Interface Definisi ---
 interface Mitra {
   id: string;
   full_name: string;
@@ -33,16 +34,17 @@ interface StockBatch {
   remaining_qty_at_partner: number;
   price_at_time: number;
   transactions: {
-    mitra_id: string;
+    id: string;
     total_amount: number;
     paid_amount: number;
+    mitra_id: string;
+    payment_method: string;
   } | null;
 }
 
 export default function LaporanPenjualanMitra() {
   const supabase = useMemo(() => createClient(), []);
   const searchParams = useSearchParams();
-
   const selectedMonth = useMemo(
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
@@ -81,31 +83,13 @@ export default function LaporanPenjualanMitra() {
   useEffect(() => {
     const monthStr = String(selectedMonth).padStart(2, "0");
     const today = new Date();
-    if (
+    setReportDateInput(
       selectedMonth === today.getMonth() + 1 &&
-      selectedYear === today.getFullYear()
-    ) {
-      setReportDateInput(today.toISOString().split("T")[0]);
-    } else {
-      setReportDateInput(`${selectedYear}-${monthStr}-01`);
-    }
-  }, [selectedMonth, selectedYear]);
-
-  const getHistoricalTierLabel = (r: PartnerReport) => {
-    if (!r.base_price_at_time || r.base_price_at_time === 0)
-      return r.mitra?.current_tier || "Member";
-
-    const modalPerItem = r.selling_price - r.commission_rate;
-    const discountPercent = Math.round(
-      (1 - modalPerItem / r.base_price_at_time) * 100,
+        selectedYear === today.getFullYear()
+        ? today.toISOString().split("T")[0]
+        : `${selectedYear}-${monthStr}-01`,
     );
-
-    if (discountPercent >= 44) return "Distributor";
-    if (discountPercent >= 34) return "Agen";
-    if (discountPercent >= 24) return "Sub-Agen";
-    if (discountPercent >= 14) return "Reseller";
-    return "Member";
-  };
+  }, [selectedMonth, selectedYear]);
 
   const fetchReports = useCallback(async () => {
     const start = new Date(
@@ -126,7 +110,6 @@ export default function LaporanPenjualanMitra() {
       59,
       999,
     ).toISOString();
-
     const { data } = await supabase
       .from("partner_reports")
       .select(
@@ -135,211 +118,209 @@ export default function LaporanPenjualanMitra() {
       .gte("created_at", start)
       .lte("created_at", end)
       .order("created_at", { ascending: false });
-
     if (data) setReports(data as unknown as PartnerReport[]);
   }, [supabase, selectedMonth, selectedYear]);
 
   useEffect(() => {
-    let isMounted = true;
     (async () => {
       const [m, p] = await Promise.all([
         supabase.from("mitra").select("*").order("full_name"),
         supabase.from("products").select("*").order("name"),
       ]);
-      if (isMounted) {
-        if (m.data) setMitraList(m.data as Mitra[]);
-        if (p.data) setProducts(p.data as Product[]);
-        await fetchReports();
-        setLoading(false);
-      }
+      if (m.data) setMitraList(m.data as Mitra[]);
+      if (p.data) setProducts(p.data as Product[]);
+      await fetchReports();
+      setLoading(false);
     })();
-    return () => {
-      isMounted = false;
-    };
   }, [supabase, fetchReports]);
 
+  // --- LOGIKA REVERSAL (HAPUS) ---
   const handleDeleteReport = async (report: PartnerReport) => {
-    if (
-      !confirm(
-        "Hapus laporan jualan ini? Sisa stok di mitra akan dikembalikan & piutang ke pusat akan dimunculkan kembali.",
-      )
-    )
+    if (!confirm("Hapus laporan? Stok & Saldo akan disinkronkan kembali."))
       return;
-    const toastId = toast.loading(
-      "Membatalkan laporan & mengembalikan stok...",
-    );
-
+    const toastId = toast.loading("Sinkronisasi Reversal...");
     try {
-      const modalValuePerItem = report.selling_price - report.commission_rate;
-      const totalModalToRestore = report.qty * modalValuePerItem;
-
-      const { data: lastBatch } = await supabase
+      const { data: rawBatch } = await supabase
         .from("transaction_items")
         .select(
-          `
-          id, 
-          transaction_id, 
-          remaining_qty_at_partner, 
-          transactions!inner(id, total_amount, paid_amount)
-        `,
+          `id, transaction_id, remaining_qty_at_partner, price_at_time, transactions!inner(id, total_amount, paid_amount, mitra_id, payment_method)`,
         )
         .eq("product_id", report.product_id)
         .eq("transactions.mitra_id", report.mitra_id)
-        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
         .limit(1)
         .single();
 
-      if (lastBatch) {
-        await supabase
-          .from("transaction_items")
-          .update({
-            remaining_qty_at_partner:
-              (lastBatch.remaining_qty_at_partner || 0) + report.qty,
-          })
-          .eq("id", lastBatch.id);
+      const batch = rawBatch as unknown as StockBatch;
+      if (!batch || !batch.transactions)
+        throw new Error("Batch transaksi tidak ditemukan.");
 
-        const tx = lastBatch.transactions as unknown as {
-          id: string;
-          total_amount: number;
-          paid_amount: number;
-        };
-        const newTotal = tx.total_amount + totalModalToRestore;
-        const newPaid = Math.max(0, tx.paid_amount - totalModalToRestore);
+      // 1. Kembalikan stok mitra
+      await supabase
+        .from("transaction_items")
+        .update({
+          remaining_qty_at_partner:
+            Number(batch.remaining_qty_at_partner) + Number(report.qty),
+        })
+        .eq("id", batch.id);
 
+      // 2. LOGIKA FIX: Hanya tarik balik dana jika asalnya PIUTANG
+      const isBeliPutus =
+        batch.transactions.payment_method === "QRIS" ||
+        batch.transactions.payment_method === "Transfer";
+      if (!isBeliPutus) {
+        const modalToRestore = Math.round(
+          Number(report.qty) * Number(batch.price_at_time),
+        );
         await supabase
           .from("transactions")
           .update({
-            total_amount: Math.round(newTotal),
-            paid_amount: Math.round(newPaid),
+            total_amount: Math.round(
+              Number(batch.transactions.total_amount) + modalToRestore,
+            ),
+            paid_amount: Math.round(
+              Math.max(
+                0,
+                Number(batch.transactions.paid_amount) - modalToRestore,
+              ),
+            ),
             payment_status: "Unpaid",
           })
-          .eq("id", lastBatch.transaction_id);
+          .eq("id", batch.transactions.id);
       }
 
-      const { error: deleteError } = await supabase
-        .from("partner_reports")
-        .delete()
-        .eq("id", report.id);
-      if (deleteError) throw deleteError;
-
-      toast.success("Laporan berhasil dibatalkan!", { id: toastId });
+      await supabase.from("partner_reports").delete().eq("id", report.id);
+      toast.success("DATA BERHASIL DI-RESET!", { id: toastId });
       await fetchReports();
-    } catch (err) {
-      console.error("Delete Error:", err);
-      toast.error("Gagal menghapus data!", { id: toastId });
+    } catch (err: unknown) {
+      const error = err as Error;
+      toast.error(error.message || "Gagal!", { id: toastId });
     }
   };
 
+  // --- LOGIKA SIMPAN PENJUALAN ---
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (
-      totalOmzetInput <= 0 ||
-      !selectedMitra ||
-      !selectedProduct ||
-      !reportDateInput
-    )
+    if (!selectedMitra || !selectedProduct || totalOmzetInput <= 0)
       return toast.error("Data tidak lengkap!");
-    const toastId = toast.loading("Sinkronisasi Stok & Piutang...");
 
+    const toastId = toast.loading("Memproses Penjualan...");
     try {
+      // Ambil stok batch tertua (FIFO)
       const { data: rawStock } = await supabase
         .from("transaction_items")
         .select(
-          `id, transaction_id, remaining_qty_at_partner, price_at_time, transactions!inner(mitra_id, total_amount, paid_amount)`,
+          `id, transaction_id, remaining_qty_at_partner, price_at_time, transactions!inner(mitra_id, total_amount, paid_amount, payment_method)`,
         )
         .eq("product_id", selectedProduct)
         .eq("transactions.mitra_id", selectedMitra)
         .gt("remaining_qty_at_partner", 0)
         .order("id", { ascending: true });
-
       const stockItems = rawStock as unknown as StockBatch[];
+
       if (!stockItems || stockItems.length === 0) {
         toast.dismiss(toastId);
         return toast.error("Stok mitra kosong!");
       }
 
-      const productObj = products.find((p) => p.id === selectedProduct);
-      if (!productObj) return;
-
       let remainingToProcess = qtyToSell;
-      let totalModalCalculated = 0;
+      let totalModalLaku = 0;
 
       for (const item of stockItems) {
         if (remainingToProcess <= 0) break;
-        const takeQty = Math.min(
+        const take = Math.min(
           item.remaining_qty_at_partner,
           remainingToProcess,
         );
-        const subTotalModal = takeQty * item.price_at_time;
-        totalModalCalculated += subTotalModal;
+        const modalValue = take * item.price_at_time;
+        totalModalLaku += modalValue;
 
+        // A. Potong stok mitra
         await supabase
           .from("transaction_items")
           .update({
-            remaining_qty_at_partner: item.remaining_qty_at_partner - takeQty,
+            remaining_qty_at_partner: item.remaining_qty_at_partner - take,
           })
           .eq("id", item.id);
 
+        // B. LOGIKA KRUSIAL: Update saldo kas HANYA JIKA transaksi asalnya PIUTANG
         if (item.transactions) {
-          const amountToShift = Math.min(
-            item.transactions.total_amount,
-            subTotalModal,
-          );
-          await supabase
-            .from("transactions")
-            .update({
-              total_amount: Math.round(
-                item.transactions.total_amount - amountToShift,
-              ),
-              paid_amount: Math.round(
-                item.transactions.paid_amount + amountToShift,
-              ),
-              payment_status:
-                item.transactions.total_amount - amountToShift <= 1
-                  ? "Paid"
-                  : "Unpaid",
-            })
-            .eq("id", item.transaction_id);
+          const isBeliPutus =
+            item.transactions.payment_method === "QRIS" ||
+            item.transactions.payment_method === "Transfer";
+
+          if (!isBeliPutus) {
+            const shiftAmount = Math.min(
+              item.transactions.total_amount,
+              modalValue,
+            );
+            await supabase
+              .from("transactions")
+              .update({
+                total_amount: Math.round(
+                  item.transactions.total_amount - shiftAmount,
+                ),
+                paid_amount: Math.round(
+                  item.transactions.paid_amount + shiftAmount,
+                ),
+                payment_status:
+                  item.transactions.total_amount - shiftAmount <= 1
+                    ? "Paid"
+                    : "Unpaid",
+              })
+              .eq("id", item.transaction_id);
+          }
+          // Jika isBeliPutus == true, kodingan di atas dilewati. Saldo Kas Aman!
         }
-        remainingToProcess -= takeQty;
+        remainingToProcess -= take;
       }
 
-      const pricePerItem = totalOmzetInput / qtyToSell;
-      const commissionPerItem = pricePerItem - totalModalCalculated / qtyToSell;
-      const finalCreatedAt = new Date(
+      // C. Simpan laporan performa (untuk statistik mitra paling cuan)
+      const finalAt = new Date(
         `${reportDateInput}T${new Date().toTimeString().split(" ")[0]}`,
       ).toISOString();
+      await supabase.from("partner_reports").insert([
+        {
+          mitra_id: selectedMitra,
+          product_id: selectedProduct,
+          qty: qtyToSell,
+          base_price_at_time:
+            products.find((p) => p.id === selectedProduct)?.base_price || 0,
+          selling_price: totalOmzetInput / qtyToSell,
+          commission_rate:
+            totalOmzetInput / qtyToSell - totalModalLaku / qtyToSell,
+          total_omzet_value: totalOmzetInput,
+          created_at: finalAt,
+        },
+      ]);
 
-      const { error: insertError } = await supabase
-        .from("partner_reports")
-        .insert([
-          {
-            mitra_id: selectedMitra,
-            product_id: selectedProduct,
-            qty: qtyToSell,
-            base_price_at_time: productObj.base_price,
-            selling_price: pricePerItem,
-            commission_rate: commissionPerItem,
-            total_omzet_value: totalOmzetInput,
-            is_commission_paid: false,
-            created_at: finalCreatedAt,
-          },
-        ]);
-
-      if (insertError) throw insertError;
-      toast.success("Laporan berhasil dicatat!", { id: toastId });
+      toast.success("Laporan Berhasil!", { id: toastId });
       setQtyToSell(1);
       setTotalOmzetInput(0);
       await fetchReports();
     } catch {
-      toast.error("Gagal menyimpan laporan!", { id: toastId });
+      toast.error("Gagal simpan!");
     }
+  };
+
+  const getHistoricalTierLabel = (r: PartnerReport) => {
+    if (!r.base_price_at_time || r.base_price_at_time === 0)
+      return r.mitra?.current_tier || "Member";
+    const modalPerItem = r.selling_price - r.commission_rate;
+    const discountPercent = Math.round(
+      (1 - modalPerItem / r.base_price_at_time) * 100,
+    );
+    if (discountPercent >= 44) return "Distributor";
+    if (discountPercent >= 34) return "Agen";
+    if (discountPercent >= 24) return "Sub-Agen";
+    if (discountPercent >= 14) return "Reseller";
+    return "Member";
   };
 
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
-        Sync Laporan...
+        Sync Laporan Penjualan...
       </div>
     );
 
@@ -347,7 +328,7 @@ export default function LaporanPenjualanMitra() {
     <div className="p-8 max-w-7xl mx-auto font-sans text-gray-900">
       <header className="mb-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <h1 className="text-4xl font-black text-green-900 italic uppercase tracking-tighter flex items-center gap-3">
-          <ClipboardList size={40} /> Laporan Jualan Mitra
+          <ClipboardList size={40} /> Performa Jualan Mitra
         </h1>
         <div className="bg-orange-50 px-4 py-2 rounded-2xl border border-orange-100 flex items-center gap-2">
           <CalendarDays size={16} className="text-orange-600" />
@@ -380,7 +361,7 @@ export default function LaporanPenjualanMitra() {
             <select
               value={selectedMitra}
               onChange={(e) => setSelectedMitra(e.target.value)}
-              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none cursor-pointer"
             >
               <option value="">-- Pilih Mitra --</option>
               {mitraList.map((m) => (
@@ -397,7 +378,7 @@ export default function LaporanPenjualanMitra() {
             <select
               value={selectedProduct}
               onChange={(e) => setSelectedProduct(e.target.value)}
-              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold outline-none cursor-pointer"
             >
               <option value="">-- Pilih Produk --</option>
               {products.map((p) => (
@@ -421,15 +402,20 @@ export default function LaporanPenjualanMitra() {
           </div>
           <div className="md:col-span-2">
             <label className="text-[10px] font-black uppercase text-gray-500 mb-2 ml-1">
-              Total Penjualan (Rp)
+              Total Omzet (Rp)
             </label>
             <input
               type="text"
-              value={totalOmzetInput.toLocaleString("id-ID")}
+              value={
+                totalOmzetInput === 0
+                  ? ""
+                  : totalOmzetInput.toLocaleString("id-ID")
+              }
+              placeholder="Masukkan angka..."
               onChange={(e) =>
                 setTotalOmzetInput(Number(e.target.value.replace(/\D/g, "")))
               }
-              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold"
+              className="w-full p-4 bg-gray-50 border rounded-2xl font-bold focus:ring-2 focus:ring-green-500"
             />
           </div>
         </div>
@@ -437,66 +423,53 @@ export default function LaporanPenjualanMitra() {
           type="submit"
           className="w-full bg-green-800 text-white py-5 rounded-2xl font-black uppercase shadow-lg hover:bg-green-900 transition-all active:scale-[0.98]"
         >
-          SIMPAN LAPORAN JUALAN
+          SIMPAN PENJUALAN
         </button>
       </form>
 
       <div className="bg-white rounded-[40px] shadow-2xl overflow-hidden border border-gray-100">
         <table className="w-full text-left">
-          <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase border-b">
+          <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
             <tr>
               <th className="p-8 w-16 text-center border-r">No</th>
               <th className="p-8">Waktu Jualan</th>
               <th className="p-8">Mitra</th>
               <th className="p-8 text-center">Qty</th>
-              <th className="p-8 text-right">Total Penjualan</th>
+              <th className="p-8 text-right">Total Jualan</th>
               <th className="p-8 text-center">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {reports.length > 0 ? (
-              reports.map((r, idx) => (
-                <tr key={r.id} className="hover:bg-gray-50/50 transition-all">
-                  <td className="p-8 text-gray-300 font-bold text-center border-r">
-                    {idx + 1}
-                  </td>
-                  <td className="p-8 font-mono text-[10px] text-gray-400">
-                    {new Date(r.created_at).toLocaleDateString("id-ID")}
-                  </td>
-                  <td className="p-8">
-                    <div className="font-bold text-gray-800 uppercase">
-                      {r.mitra?.full_name}
-                    </div>
-                    <div className="text-[9px] font-black uppercase text-green-600">
-                      {getHistoricalTierLabel(r)}
-                    </div>
-                  </td>
-                  <td className="p-8 text-center font-black text-lg">
-                    {r.qty}
-                  </td>
-                  <td className="p-8 text-right font-black text-green-700">
-                    Rp {(r.selling_price * r.qty).toLocaleString("id-ID")}
-                  </td>
-                  <td className="p-8 text-center">
-                    <button
-                      onClick={() => handleDeleteReport(r)}
-                      className="p-3 bg-red-50 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all shadow-sm"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td
-                  colSpan={6}
-                  className="p-20 text-center text-gray-300 italic font-bold uppercase tracking-widest"
-                >
-                  Tidak ada laporan jualan
+            {reports.map((r, idx) => (
+              <tr key={r.id} className="hover:bg-gray-50/50 transition-all">
+                <td className="p-8 text-gray-300 font-bold text-center border-r">
+                  {idx + 1}
+                </td>
+                <td className="p-8 font-mono text-[10px] text-gray-400">
+                  {new Date(r.created_at).toLocaleDateString("id-ID")}
+                </td>
+                <td className="p-8">
+                  <div className="font-bold text-gray-800 uppercase">
+                    {r.mitra?.full_name}
+                  </div>
+                  <div className="text-[9px] font-black uppercase text-green-600">
+                    {getHistoricalTierLabel(r)}
+                  </div>
+                </td>
+                <td className="p-8 text-center font-black text-lg">{r.qty}</td>
+                <td className="p-8 text-right font-black text-green-700">
+                  Rp {(r.selling_price * r.qty).toLocaleString("id-ID")}
+                </td>
+                <td className="p-8 text-center">
+                  <button
+                    onClick={() => handleDeleteReport(r)}
+                    className="p-3 bg-red-50 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all shadow-sm"
+                  >
+                    <Trash2 size={16} />
+                  </button>
                 </td>
               </tr>
-            )}
+            ))}
           </tbody>
         </table>
       </div>

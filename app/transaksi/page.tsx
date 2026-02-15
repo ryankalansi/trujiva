@@ -1,10 +1,11 @@
 "use client";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import toast from "react-hot-toast";
 import { Calendar, History } from "lucide-react";
 
+// --- Interface Definisi ---
 interface Product {
   id: string;
   name: string;
@@ -17,18 +18,17 @@ interface Mitra {
   current_tier: string;
   is_rp: boolean;
 }
-type PaymentMethod = "QRIS" | "Transfer" | "Piutang";
+// Update type: QRIS & Transfer digabung secara fungsional
+type PaymentOption = "QRIS_TRANSFER" | "Piutang";
 
 export default function TransaksiPage() {
   const supabase = useMemo(() => createClient(), []);
-  const router = useRouter();
   const searchParams = useSearchParams();
 
   const selectedMonth = useMemo(
     () => Number(searchParams.get("month")) || new Date().getMonth() + 1,
     [searchParams],
   );
-
   const selectedYear = useMemo(
     () => Number(searchParams.get("year")) || new Date().getFullYear(),
     [searchParams],
@@ -36,42 +36,41 @@ export default function TransaksiPage() {
 
   const [products, setProducts] = useState<Product[]>([]);
   const [mitra, setMitra] = useState<Mitra[]>([]);
-  const [loading, setLoading] = useState(true); // Digunakan untuk indikator awal
+  const [loading, setLoading] = useState(true);
   const [selectedMitra, setSelectedMitra] = useState("");
   const [selectedProduct, setSelectedProduct] = useState("");
   const [qty, setQty] = useState(1);
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("QRIS");
+  // Default ke opsi gabungan QRIS / TRANSFER
+  const [paymentOption, setPaymentOption] =
+    useState<PaymentOption>("QRIS_TRANSFER");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [transactionDate, setTransactionDate] = useState("");
 
   useEffect(() => {
     const monthStr = String(selectedMonth).padStart(2, "0");
     const today = new Date();
-    if (
+    setTransactionDate(
       selectedMonth === today.getMonth() + 1 &&
-      selectedYear === today.getFullYear()
-    ) {
-      setTransactionDate(today.toISOString().split("T")[0]);
-    } else {
-      setTransactionDate(`${selectedYear}-${monthStr}-01`);
-    }
+        selectedYear === today.getFullYear()
+        ? today.toISOString().split("T")[0]
+        : `${selectedYear}-${monthStr}-01`,
+    );
   }, [selectedMonth, selectedYear]);
 
   const fetchData = useCallback(async () => {
     try {
-      const { data: p } = await supabase
-        .from("products")
-        .select("*")
-        .eq("is_active", true)
-        .order("name");
-      const { data: m } = await supabase
-        .from("mitra")
-        .select("*")
-        .order("full_name");
+      const [{ data: p }, { data: m }] = await Promise.all([
+        supabase
+          .from("products")
+          .select("*")
+          .eq("is_active", true)
+          .order("name"),
+        supabase.from("mitra").select("*").order("full_name"),
+      ]);
       if (p) setProducts(p as Product[]);
       if (m) setMitra(m as Mitra[]);
     } finally {
-      setLoading(false); // Dipakai di sini
+      setLoading(false);
     }
   }, [supabase]);
 
@@ -90,16 +89,16 @@ export default function TransaksiPage() {
     try {
       const product = products.find((p) => p.id === selectedProduct);
       const mTerpilih = mitra.find((m) => m.id === selectedMitra);
-      if (!product || !mTerpilih) return;
+      if (!product || !mTerpilih) throw new Error("Data tidak ditemukan");
 
       const { data: history } = await supabase
         .from("transaction_items")
         .select(`qty, transactions!inner(mitra_id)`)
         .eq("transactions.mitra_id", selectedMitra);
 
-      const totalQtyLama =
-        history?.reduce((acc, curr) => acc + curr.qty, 0) || 0;
-      const totalAkumulasiBruto = (totalQtyLama + qty) * product.base_price;
+      const totalAkumulasiBruto =
+        ((history?.reduce((acc, curr) => acc + curr.qty, 0) || 0) + qty) *
+        product.base_price;
 
       const tierRank: Record<string, number> = {
         "Member": 0,
@@ -115,14 +114,12 @@ export default function TransaksiPage() {
       else if (totalAkumulasiBruto >= 5000000) calculatedTier = "Sub-Agen";
       else if (totalAkumulasiBruto >= 500000) calculatedTier = "Reseller";
 
-      // FIX ESLint: Gunakan const untuk finalTier
-      const currentTierAtDatabase = mTerpilih.current_tier;
       const finalTier =
-        tierRank[calculatedTier] > tierRank[currentTierAtDatabase]
+        tierRank[calculatedTier] > tierRank[mTerpilih.current_tier]
           ? calculatedTier
-          : currentTierAtDatabase;
+          : mTerpilih.current_tier;
 
-      if (finalTier !== currentTierAtDatabase) {
+      if (finalTier !== mTerpilih.current_tier) {
         await supabase
           .from("mitra")
           .update({ current_tier: finalTier })
@@ -137,18 +134,22 @@ export default function TransaksiPage() {
         "Distributor": 0.45,
       };
 
-      const discountRate = rates[finalTier] || 0;
-      const netAmount = qty * product.base_price * (1 - discountRate);
-      const isPiutang = paymentMethod === "Piutang";
+      const netAmount = Math.round(
+        qty * product.base_price * (1 - (rates[finalTier] || 0)),
+      );
+      const isPiutang = paymentOption === "Piutang";
 
+      // Simpan Transaksi Utama
       const { data: trans, error: transError } = await supabase
         .from("transactions")
         .insert([
           {
             mitra_id: selectedMitra,
-            total_amount: Math.round(isPiutang ? netAmount : 0),
-            paid_amount: Math.round(isPiutang ? 0 : netAmount),
-            payment_method: paymentMethod,
+            // Jika Piutang, total_amount diisi (piutang). Jika QRIS/Transfer, total_amount 0.
+            total_amount: isPiutang ? netAmount : 0,
+            // Jika QRIS/Transfer, paid_amount langsung terisi (Netto Ke Pusat).
+            paid_amount: isPiutang ? 0 : netAmount,
+            payment_method: isPiutang ? "Piutang" : "QRIS", // Simpan sebagai QRIS di DB untuk kategori lunas
             payment_status: isPiutang ? "Unpaid" : "Paid",
             created_at: new Date(
               `${transactionDate}T${new Date().toTimeString().split(" ")[0]}`,
@@ -166,7 +167,7 @@ export default function TransaksiPage() {
           product_id: selectedProduct,
           qty,
           remaining_qty_at_partner: qty,
-          price_at_time: product.base_price * (1 - discountRate),
+          price_at_time: product.base_price * (1 - (rates[finalTier] || 0)),
         },
       ]);
 
@@ -175,15 +176,14 @@ export default function TransaksiPage() {
         .update({ stock: product.stock - qty })
         .eq("id", product.id);
 
-      toast.success(
-        `${mTerpilih.full_name} (${finalTier}) berhasil diproses!`,
-        { id: toastId },
-      );
-      router.refresh();
-      await fetchData();
+      toast.success(`${mTerpilih.full_name} berhasil diproses!`, {
+        id: toastId,
+      });
+
       setSelectedMitra("");
       setSelectedProduct("");
       setQty(1);
+      await fetchData();
     } catch (err) {
       console.error(err);
       toast.error("Transaksi gagal!", { id: toastId });
@@ -192,7 +192,6 @@ export default function TransaksiPage() {
     }
   };
 
-  // FIX ESLint: Gunakan variabel loading untuk tampilan agar tidak 'Unused'
   if (loading)
     return (
       <div className="p-20 text-center font-black animate-pulse text-green-800 uppercase italic">
@@ -243,9 +242,7 @@ export default function TransaksiPage() {
             type="date"
             value={transactionDate}
             onChange={(e) => setTransactionDate(e.target.value)}
-            min={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-01`}
-            max={`${selectedYear}-${String(selectedMonth).padStart(2, "0")}-${new Date(selectedYear, selectedMonth, 0).getDate()}`}
-            className="w-full p-3 bg-white border border-orange-200 rounded-xl font-bold text-orange-900 outline-none focus:ring-2 focus:ring-orange-500 cursor-pointer"
+            className="w-full p-3 bg-white border border-orange-200 rounded-xl font-bold text-orange-900 outline-none focus:ring-2 focus:ring-orange-500"
           />
         </div>
 
@@ -256,7 +253,7 @@ export default function TransaksiPage() {
           <select
             value={selectedMitra}
             onChange={(e) => setSelectedMitra(e.target.value)}
-            className="w-full p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500 cursor-pointer"
+            className="w-full p-4 bg-gray-50 border border-gray-200 rounded-2xl font-bold outline-none focus:ring-2 focus:ring-green-500"
           >
             <option value="">-- Pilih Mitra --</option>
             {mitra.map((m) => (
@@ -299,27 +296,39 @@ export default function TransaksiPage() {
           </div>
         </div>
 
-        <div className="flex gap-4 justify-center bg-gray-50/50 p-4 rounded-2xl border border-dashed border-gray-200">
-          {(["QRIS", "Transfer", "Piutang"] as PaymentMethod[]).map((m) => (
-            <label
-              key={m}
-              className="flex items-center gap-2 cursor-pointer group"
+        {/* Update: UI Radio Button untuk QRIS/TRANSFER yang digabung */}
+        <div className="flex gap-12 justify-center bg-gray-50/50 p-4 rounded-2xl border border-dashed border-gray-200">
+          <label className="flex items-center gap-2 cursor-pointer group">
+            <input
+              type="radio"
+              name="pay"
+              value="QRIS_TRANSFER"
+              checked={paymentOption === "QRIS_TRANSFER"}
+              onChange={() => setPaymentOption("QRIS_TRANSFER")}
+              className="w-4 h-4 accent-green-600"
+            />
+            <span
+              className={`text-[10px] font-black uppercase tracking-widest transition-colors ${paymentOption === "QRIS_TRANSFER" ? "text-green-700" : "text-gray-400"}`}
             >
-              <input
-                type="radio"
-                name="pay"
-                value={m}
-                checked={paymentMethod === m}
-                onChange={() => setPaymentMethod(m)}
-                className="w-4 h-4 accent-green-600"
-              />
-              <span
-                className={`text-[10px] font-black uppercase tracking-widest transition-colors ${paymentMethod === m ? "text-green-700" : "text-gray-400 group-hover:text-gray-600"}`}
-              >
-                {m}
-              </span>
-            </label>
-          ))}
+              QRIS / TRANSFER
+            </span>
+          </label>
+
+          <label className="flex items-center gap-2 cursor-pointer group">
+            <input
+              type="radio"
+              name="pay"
+              value="Piutang"
+              checked={paymentOption === "Piutang"}
+              onChange={() => setPaymentOption("Piutang")}
+              className="w-4 h-4 accent-red-600"
+            />
+            <span
+              className={`text-[10px] font-black uppercase tracking-widest transition-colors ${paymentOption === "Piutang" ? "text-red-700" : "text-gray-400"}`}
+            >
+              PIUTANG
+            </span>
+          </label>
         </div>
 
         <button
