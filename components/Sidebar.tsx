@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase";
+import Image from "next/image";
 import { useMemo } from "react";
 import {
   LayoutDashboard,
@@ -65,9 +66,14 @@ export default function Sidebar() {
         <h1 className="text-2xl font-black italic tracking-tighter text-white">
           TRUJIVA
         </h1>
-        <p className="text-[10px] font-black text-green-400 uppercase tracking-[0.2em] mt-1">
-          Backoffice System
-        </p>
+
+        <Image
+          src="/rumah-perubahan-logo.png"
+          alt="Logo Rumah Perubahan"
+          width={200}
+          height={150}
+          className="object-contain"
+        />
       </div>
 
       <nav className="flex-1 space-y-2">

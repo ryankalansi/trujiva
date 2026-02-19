@@ -2,6 +2,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase";
+import Image from "next/image";
 
 export default function LandingPage() {
   const [isLoading, setIsLoading] = useState(true);
@@ -61,6 +62,15 @@ export default function LandingPage() {
           <p className="text-gray-400 text-[10px] uppercase tracking-widest mt-2 font-black">
             Internal Reporting System
           </p>
+          <div className="mt-4 flex justify-center">
+            <Image
+              src="/rumah-perubahan-logo.png"
+              alt="Logo Rumah Perubahan"
+              width={200}
+              height={250}
+              className="object-contain"
+            />
+          </div>
         </div>
 
         {errorMsg && (
