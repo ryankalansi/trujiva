@@ -111,7 +111,6 @@ export default function ExecutiveDashboard() {
     "Desember",
   ];
 
-  // FIX: Fungsi ini sekarang dipanggil di bawah
   const updateURL = (month: number, year: number) => {
     const params = new URLSearchParams(searchParams.toString());
     params.set("month", month.toString());
@@ -152,7 +151,8 @@ export default function ExecutiveDashboard() {
       supabase
         .from("transaction_items")
         .select(
-          `qty, remaining_qty_at_partner, price_at_time, product:product_id(name, base_price), transactions!inner(id, created_at, payment_status, payment_method, paid_amount, total_amount, is_sample, mitra:mitra_id(id, full_name, current_tier))`,
+          `qty, remaining_qty_at_partner, price_at_time, product:product_id(name, base_price),
+           transactions!inner(id, created_at, payment_status, payment_method, paid_amount, total_amount, is_sample, mitra:mitra_id(id, full_name, current_tier))`,
         )
         .lte("transactions.created_at", end),
       supabase.from("mitra").select("id", { count: "exact", head: true }),
@@ -164,56 +164,74 @@ export default function ExecutiveDashboard() {
       setRawPartnerReports(reports);
       setRawTransactionItems(items);
 
+      // Items yang transaksinya ada di bulan ini
       const itemsThisMonth = items.filter(
         (i) => i.transactions && i.transactions.created_at >= start,
       );
 
-      const totalPaidDirect = itemsThisMonth
-        .filter((i) => !i.transactions?.is_sample)
-        .reduce((acc, curr) => {
-          const isBeliPutus =
-            curr.transactions?.payment_method === "QRIS" ||
-            curr.transactions?.payment_method === "Transfer";
-          const isUnique =
-            itemsThisMonth.findIndex(
-              (i) => i.transactions?.id === curr.transactions?.id,
-            ) === itemsThisMonth.indexOf(curr);
-          return (
-            acc +
-            (isUnique && isBeliPutus ? curr.transactions?.paid_amount || 0 : 0)
-          );
-        }, 0);
-
-      let totalPelunasanPiutang = 0;
-      for (const r of reports) {
-        const originBatch = items.find(
-          (i) =>
-            i.transactions?.mitra?.id === r.mitra_id &&
-            i.product?.name === r.product?.name,
-        );
-        if (originBatch?.transactions?.payment_method === "Piutang") {
-          totalPelunasanPiutang +=
-            (r.selling_price - r.commission_rate) * r.qty;
+      // KAS MASUK 1: Dari QRIS/Transfer (beli putus) - langsung lunas saat ambil barang
+      // Deduplicate per transaction ID agar tidak double-count
+      const seenTxIds = new Set<string>();
+      let totalPaidDirect = 0;
+      for (const i of itemsThisMonth) {
+        if (i.transactions?.is_sample) continue;
+        const isBeliPutus =
+          i.transactions?.payment_method === "QRIS" ||
+          i.transactions?.payment_method === "Transfer";
+        if (!isBeliPutus) continue;
+        const txId = i.transactions?.id;
+        if (txId && !seenTxIds.has(txId)) {
+          seenTxIds.add(txId);
+          totalPaidDirect += i.transactions?.paid_amount || 0;
         }
       }
 
+      // KAS MASUK 2: Dari pelunasan piutang
+      // CARA BENAR: Baca paid_amount langsung dari transaksi Piutang (sudah di-update otomatis saat mitra jual)
+      // Ini jauh lebih akurat daripada lookup dari partner_reports karena paid_amount adalah single source of truth
+      const seenPiutangTxIds = new Set<string>();
+      let totalPelunasanPiutang = 0;
+      for (const i of items) {
+        if (i.transactions?.is_sample) continue;
+        if (i.transactions?.payment_method !== "Piutang") continue;
+        const txId = i.transactions?.id;
+        if (txId && !seenPiutangTxIds.has(txId)) {
+          seenPiutangTxIds.add(txId);
+          // paid_amount di transaksi Piutang = total yang sudah terbayar (dari penjualan mitra)
+          totalPelunasanPiutang += i.transactions?.paid_amount || 0;
+        }
+      }
+
+      // SISA PIUTANG: Semua piutang yang belum lunas (remaining_qty_at_partner * price_at_time)
+      // FIX: Tidak filter by start date agar piutang dari bulan lalu yang belum lunas tetap terhitung
+      // Tapi hanya hitung yang transaksi asalnya Piutang
+      const piutangSisa = items
+        .filter(
+          (i) =>
+            !i.transactions?.is_sample &&
+            i.transactions?.payment_method === "Piutang" &&
+            i.remaining_qty_at_partner > 0,
+        )
+        .reduce((a, c) => a + c.remaining_qty_at_partner * c.price_at_time, 0);
+
       setStats({
+        // BRUTO KELUAR: Total harga dasar semua barang yang keluar bulan ini
         omzetKotor: itemsThisMonth
           .filter((i) => !i.transactions?.is_sample)
           .reduce((a, c) => a + c.qty * (c.product?.base_price || 0), 0),
+
+        // KAS MASUK: QRIS/Transfer langsung + pelunasan piutang dari penjualan mitra
         dibayarKePusat: totalPaidDirect + totalPelunasanPiutang,
-        piutangMitra: items
-          .filter(
-            (i) =>
-              !i.transactions?.is_sample &&
-              i.transactions?.payment_method === "Piutang",
-          )
-          .reduce(
-            (a, c) => a + c.remaining_qty_at_partner * c.price_at_time,
-            0,
-          ),
+
+        // SISA PIUTANG: stok mitra yang belum terjual (dari transaksi piutang) * harga netto
+        piutangMitra: piutangSisa,
+
+        // OMZET KONSUMEN: Total omzet penjualan mitra ke konsumen akhir
         omzetKonsumen: reports.reduce((a, c) => a + c.selling_price * c.qty, 0),
+
         totalMitra: mitraRes.count || 0,
+
+        // BIAYA SAMPLE: Barang keluar untuk sample bulan ini * harga dasar
         biayaSample: itemsThisMonth
           .filter((i) => i.transactions?.is_sample)
           .reduce((a, c) => a + c.qty * (c.product?.base_price || 0), 0),
@@ -277,12 +295,12 @@ export default function ExecutiveDashboard() {
       "1. Ringkasan Kas",
     );
 
-    // 2. Audit Stok Gudang (SELARAS DENGAN DASHBOARD)
+    // 2. Audit Stok Gudang
     const dataStokExcel = auditStok.map((p, idx) => ({
       "NO": idx + 1,
       "NAMA PRODUK": p.name,
-      "STOK AKTIF (GUDANG)": p.stokRealtime, // Bagian kiri dari tanda '/' di UI
-      "TOTAL KAPASITAS": p.kapasitasTotal, // Bagian kanan dari tanda '/' di UI
+      "STOK AKTIF (GUDANG)": p.stokRealtime,
+      "TOTAL KAPASITAS": p.kapasitasTotal,
       "KELUAR BULAN INI": p.barangKeluar,
       "STATUS": p.status,
     }));
@@ -374,7 +392,6 @@ export default function ExecutiveDashboard() {
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 bg-white px-4 py-2 rounded-2xl shadow-sm border border-gray-100">
-            {/* FIX: Fungsi updateURL dipanggil di sini */}
             <select
               value={selectedMonth}
               onChange={(e) => updateURL(Number(e.target.value), selectedYear)}
@@ -489,7 +506,11 @@ export default function ExecutiveDashboard() {
                   </td>
                   <td className="py-6 text-center">
                     <span
-                      className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase inline-block min-w-[70px] ${item.status === "AMAN" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}
+                      className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase inline-block min-w-[70px] ${
+                        item.status === "AMAN"
+                          ? "bg-green-100 text-green-700"
+                          : "bg-red-100 text-red-700"
+                      }`}
                     >
                       {item.status}
                     </span>
@@ -514,7 +535,9 @@ function StatCard({
 }: StatCardUIProps) {
   return (
     <div
-      className={`p-5 rounded-[25px] border border-gray-100 shadow-sm transition-all hover:-translate-y-1 ${highlight ? "ring-2 ring-green-500/20 bg-white" : "bg-white"}`}
+      className={`p-5 rounded-[25px] border border-gray-100 shadow-sm transition-all hover:-translate-y-1 ${
+        highlight ? "ring-2 ring-green-500/20 bg-white" : "bg-white"
+      }`}
     >
       <div
         className={`w-10 h-10 ${color} rounded-xl flex items-center justify-center mb-3`}
@@ -525,7 +548,9 @@ function StatCard({
         {title}
       </p>
       <h3
-        className={`text-lg font-black tracking-tighter ${highlight ? "text-green-700" : "text-gray-900"}`}
+        className={`text-lg font-black tracking-tighter ${
+          highlight ? "text-green-700" : "text-gray-900"
+        }`}
       >
         {isCurrency ? `Rp ${value.toLocaleString("id-ID")}` : value}
       </h3>

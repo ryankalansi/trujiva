@@ -41,12 +41,13 @@ interface RawTransaction {
   mitra: { full_name: string; current_tier: string } | null;
   transaction_items: {
     qty: number;
+    remaining_qty_at_partner: number;
+    price_at_time: number;
     product_id: string;
     product: { name: string } | null;
   }[];
 }
 
-// FIX: Tambahkan interface khusus untuk data report agar tidak pakai 'any'
 interface ReportItem {
   id: string;
   created_at: string;
@@ -125,7 +126,9 @@ export default function ArusKasPusatPage() {
       supabase
         .from("transactions")
         .select(
-          `id, created_at, paid_amount, total_amount, payment_status, payment_method, mitra_id, mitra:mitra_id(full_name, current_tier), transaction_items(qty, product_id, product:product_id(name))`,
+          `id, created_at, paid_amount, total_amount, payment_status, payment_method, mitra_id,
+           mitra:mitra_id(full_name, current_tier),
+           transaction_items(qty, remaining_qty_at_partner, price_at_time, product_id, product:product_id(name))`,
         )
         .eq("is_sample", false)
         .gte("created_at", start)
@@ -133,19 +136,45 @@ export default function ArusKasPusatPage() {
       supabase
         .from("partner_reports")
         .select(
-          `id, created_at, qty, selling_price, commission_rate, mitra_id, product_id, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
+          `id, created_at, qty, selling_price, commission_rate, mitra_id, product_id,
+           mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
         )
         .gte("created_at", start)
         .lte("created_at", end),
     ]);
 
-    // FIX: Gunakan interface ReportItem di sini
     const reportsRaw = (reportsData.data as unknown as ReportItem[]) || [];
     const trans = (transData.data as unknown as RawTransaction[]) || [];
     const combined: CombinedHistory[] = [];
 
     // 1. Map Pengambilan Barang
     trans.forEach((t) => {
+      const isPiutang = t.payment_method === "Piutang";
+
+      let paidAmount = 0;
+      let unpaidAmount = 0;
+
+      if (isPiutang) {
+        // FIX: Untuk Piutang, hitung dari snapshot qty & price_at_time di transaction_items
+        // bukan dari paid_amount/total_amount di tabel transactions yang berubah dinamis saat ada penjualan
+        const totalNetto = t.transaction_items.reduce(
+          (acc, item) => acc + item.qty * item.price_at_time,
+          0,
+        );
+        const sudahTerbayar = t.transaction_items.reduce(
+          (acc, item) =>
+            acc +
+            (item.qty - item.remaining_qty_at_partner) * item.price_at_time,
+          0,
+        );
+        paidAmount = 0; // Saat ambil barang, belum ada dana masuk
+        unpaidAmount = totalNetto - sudahTerbayar; // Sisa piutang = yang belum terjual
+      } else {
+        // QRIS/Transfer: langsung lunas, paid = netto, unpaid = 0
+        paidAmount = t.paid_amount;
+        unpaidAmount = 0;
+      }
+
       combined.push({
         id: t.id,
         type: "ORDER",
@@ -157,29 +186,85 @@ export default function ArusKasPusatPage() {
           .map((i) => `${i.product?.name || "Produk"} (${i.qty} Pcs)`)
           .join(", "),
         qty: t.transaction_items[0]?.qty || 0,
-        paid: t.paid_amount,
-        unpaid: t.total_amount,
+        paid: paidAmount,
+        unpaid: unpaidAmount,
         status: t.payment_status,
         method: t.payment_method || "N/A",
       });
     });
 
     // 2. Map Penjualan
-    for (const r of reportsRaw) {
-      const { data: batchData } = await supabase
-        .from("transaction_items")
-        .select(`transactions(payment_method)`)
-        .eq("product_id", r.product_id)
-        .eq("transactions.mitra_id", r.mitra_id)
-        .order("id", { ascending: false })
-        .limit(1)
-        .single();
+    // Pendekatan baru: simulasi FIFO per mitra per produk untuk tiap entry penjualan
+    // Kita tahu berapa total stok QRIS dan Piutang per mitra per produk dari trans data
+    // Saat mitra jual, FIFO: habiskan QRIS duluan, baru Piutang
+    // Dana masuk ke kas HANYA dari pcs yang diambil dari batch Piutang
 
-      const batchResult = batchData as unknown as {
-        transactions: { payment_method: string };
-      };
-      const method = batchResult?.transactions?.payment_method || "Piutang";
-      const isBeliPutus = method === "QRIS" || method === "Transfer";
+    // Buat map: untuk setiap kombinasi mitra+produk, berapa sisa stok QRIS yang tersedia
+    // (simulasi FIFO mundur dari transaksi ORDER yang ada)
+    interface BatchInfo {
+      payment_method: string;
+      remaining: number; // sisa stok dari batch ini yang belum "dikonsumsi" penjualan
+      price_at_time: number;
+    }
+
+    // Kumpulkan semua batch per mitra+produk, urut dari terlama (FIFO)
+    const batchMap: Record<string, BatchInfo[]> = {};
+    trans.forEach((t) => {
+      t.transaction_items.forEach((item) => {
+        const key = `${t.mitra_id}__${item.product_id}`;
+        if (!batchMap[key]) batchMap[key] = [];
+        batchMap[key].push({
+          payment_method: t.payment_method,
+          // Untuk simulasi, kita pakai qty penuh (bukan remaining) karena kita akan
+          // konsumsi secara berurutan mengikuti penjualan
+          remaining: item.qty,
+          price_at_time: item.price_at_time,
+        });
+      });
+    });
+
+    // Urutkan partner_reports dari terlama ke terbaru agar konsumsi FIFO benar
+    const reportsChronological = [...reportsRaw].sort(
+      (a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+
+    // Map untuk menyimpan hasil dana masuk per report id
+    const salePaidMap: Record<string, number> = {};
+    const saleIsBeliPutusMap: Record<string, boolean> = {};
+
+    for (const r of reportsChronological) {
+      const key = `${r.mitra_id}__${r.product_id}`;
+      const batches = batchMap[key] || [];
+
+      let qtyLeft = r.qty;
+      let danaMasukEntry = 0;
+
+      for (const batch of batches) {
+        if (qtyLeft <= 0) break;
+        const take = Math.min(batch.remaining, qtyLeft);
+        if (take <= 0) continue;
+
+        if (batch.payment_method === "Piutang") {
+          // Dari batch piutang → masuk kas
+          danaMasukEntry += take * batch.price_at_time;
+        }
+        // Dari batch QRIS/Transfer → tidak masuk kas (sudah lunas)
+
+        batch.remaining -= take;
+        qtyLeft -= take;
+      }
+
+      // Tentukan apakah entry ini murni beli putus atau ada pelunasan piutang
+      const isBeliPutus = danaMasukEntry === 0;
+      salePaidMap[r.id] = danaMasukEntry;
+      saleIsBeliPutusMap[r.id] = isBeliPutus;
+    }
+
+    // Sekarang buat combined entries untuk penjualan dengan urutan asli (terbaru duluan)
+    for (const r of reportsRaw) {
+      const danaMasuk = salePaidMap[r.id] ?? 0;
+      const isBeliPutus = saleIsBeliPutusMap[r.id] ?? true;
 
       combined.push({
         id: r.id,
@@ -191,7 +276,7 @@ export default function ArusKasPusatPage() {
         tier: r.mitra?.current_tier || "Member",
         product_details: `Laku Jual: ${r.product?.name || "Produk"} (${r.qty} Pcs)`,
         qty: r.qty,
-        paid: isBeliPutus ? 0 : (r.selling_price - r.commission_rate) * r.qty,
+        paid: danaMasuk,
         unpaid: 0,
         status: isBeliPutus
           ? "LUNAS (BELI PUTUS)"

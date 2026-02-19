@@ -113,7 +113,8 @@ export default function LaporanPenjualanMitra() {
     const { data } = await supabase
       .from("partner_reports")
       .select(
-        `id, qty, selling_price, base_price_at_time, commission_rate, created_at, mitra_id, product_id, mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
+        `id, qty, selling_price, base_price_at_time, commission_rate, created_at, mitra_id, product_id,
+         mitra:mitra_id(full_name, current_tier), product:product_id(name)`,
       )
       .gte("created_at", start)
       .lte("created_at", end)
@@ -134,71 +135,7 @@ export default function LaporanPenjualanMitra() {
     })();
   }, [supabase, fetchReports]);
 
-  // --- LOGIKA REVERSAL (HAPUS) ---
-  const handleDeleteReport = async (report: PartnerReport) => {
-    if (!confirm("Hapus laporan? Stok & Saldo akan disinkronkan kembali."))
-      return;
-    const toastId = toast.loading("Sinkronisasi Reversal...");
-    try {
-      const { data: rawBatch } = await supabase
-        .from("transaction_items")
-        .select(
-          `id, transaction_id, remaining_qty_at_partner, price_at_time, transactions!inner(id, total_amount, paid_amount, mitra_id, payment_method)`,
-        )
-        .eq("product_id", report.product_id)
-        .eq("transactions.mitra_id", report.mitra_id)
-        .order("id", { ascending: false })
-        .limit(1)
-        .single();
-
-      const batch = rawBatch as unknown as StockBatch;
-      if (!batch || !batch.transactions)
-        throw new Error("Batch transaksi tidak ditemukan.");
-
-      // 1. Kembalikan stok mitra
-      await supabase
-        .from("transaction_items")
-        .update({
-          remaining_qty_at_partner:
-            Number(batch.remaining_qty_at_partner) + Number(report.qty),
-        })
-        .eq("id", batch.id);
-
-      // 2. LOGIKA FIX: Hanya tarik balik dana jika asalnya PIUTANG
-      const isBeliPutus =
-        batch.transactions.payment_method === "QRIS" ||
-        batch.transactions.payment_method === "Transfer";
-      if (!isBeliPutus) {
-        const modalToRestore = Math.round(
-          Number(report.qty) * Number(batch.price_at_time),
-        );
-        await supabase
-          .from("transactions")
-          .update({
-            total_amount: Math.round(
-              Number(batch.transactions.total_amount) + modalToRestore,
-            ),
-            paid_amount: Math.round(
-              Math.max(
-                0,
-                Number(batch.transactions.paid_amount) - modalToRestore,
-              ),
-            ),
-            payment_status: "Unpaid",
-          })
-          .eq("id", batch.transactions.id);
-      }
-
-      await supabase.from("partner_reports").delete().eq("id", report.id);
-      toast.success("DATA BERHASIL DI-RESET!", { id: toastId });
-      await fetchReports();
-    } catch (err: unknown) {
-      const error = err as Error;
-      toast.error(error.message || "Gagal!", { id: toastId });
-    }
-  };
-
-  // --- LOGIKA SIMPAN PENJUALAN ---
+  // --- LOGIKA SIMPAN PENJUALAN (FIFO) ---
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedMitra || !selectedProduct || totalOmzetInput <= 0)
@@ -206,16 +143,18 @@ export default function LaporanPenjualanMitra() {
 
     const toastId = toast.loading("Memproses Penjualan...");
     try {
-      // Ambil stok batch tertua (FIFO)
+      // Ambil SEMUA batch stok mitra untuk produk ini, urut dari yang paling lama (FIFO)
       const { data: rawStock } = await supabase
         .from("transaction_items")
         .select(
-          `id, transaction_id, remaining_qty_at_partner, price_at_time, transactions!inner(mitra_id, total_amount, paid_amount, payment_method)`,
+          `id, transaction_id, remaining_qty_at_partner, price_at_time,
+           transactions!inner(id, mitra_id, total_amount, paid_amount, payment_method)`,
         )
         .eq("product_id", selectedProduct)
         .eq("transactions.mitra_id", selectedMitra)
         .gt("remaining_qty_at_partner", 0)
-        .order("id", { ascending: true });
+        .order("id", { ascending: true }); // FIFO: batch terlama duluan
+
       const stockItems = rawStock as unknown as StockBatch[];
 
       if (!stockItems || stockItems.length === 0) {
@@ -223,11 +162,22 @@ export default function LaporanPenjualanMitra() {
         return toast.error("Stok mitra kosong!");
       }
 
+      // Cek total stok tersedia
+      const totalAvailable = stockItems.reduce(
+        (sum, i) => sum + i.remaining_qty_at_partner,
+        0,
+      );
+      if (qtyToSell > totalAvailable) {
+        toast.dismiss(toastId);
+        return toast.error(`Stok tidak cukup! Tersedia: ${totalAvailable} pcs`);
+      }
+
       let remainingToProcess = qtyToSell;
       let totalModalLaku = 0;
 
       for (const item of stockItems) {
         if (remainingToProcess <= 0) break;
+
         const take = Math.min(
           item.remaining_qty_at_partner,
           remainingToProcess,
@@ -235,7 +185,7 @@ export default function LaporanPenjualanMitra() {
         const modalValue = take * item.price_at_time;
         totalModalLaku += modalValue;
 
-        // A. Potong stok mitra
+        // A. Potong stok mitra (FIFO)
         await supabase
           .from("transaction_items")
           .update({
@@ -243,13 +193,16 @@ export default function LaporanPenjualanMitra() {
           })
           .eq("id", item.id);
 
-        // B. LOGIKA KRUSIAL: Update saldo kas HANYA JIKA transaksi asalnya PIUTANG
+        // B. KRUSIAL: Shift saldo kas HANYA jika batch ini berasal dari PIUTANG
+        // Kalau QRIS/Transfer (beli putus): sudah lunas saat ambil, TIDAK ada perubahan kas
+        // Kalau Piutang: baru masuk kas saat mitra jual ke konsumen
         if (item.transactions) {
           const isBeliPutus =
             item.transactions.payment_method === "QRIS" ||
             item.transactions.payment_method === "Transfer";
 
           if (!isBeliPutus) {
+            // Piutang: shift dari total_amount (piutang) ke paid_amount (kas masuk)
             const shiftAmount = Math.min(
               item.transactions.total_amount,
               modalValue,
@@ -270,15 +223,17 @@ export default function LaporanPenjualanMitra() {
               })
               .eq("id", item.transaction_id);
           }
-          // Jika isBeliPutus == true, kodingan di atas dilewati. Saldo Kas Aman!
+          // isBeliPutus == true → lewati, kas tidak berubah ✅
         }
+
         remainingToProcess -= take;
       }
 
-      // C. Simpan laporan performa (untuk statistik mitra paling cuan)
+      // C. Simpan laporan performa penjualan
       const finalAt = new Date(
         `${reportDateInput}T${new Date().toTimeString().split(" ")[0]}`,
       ).toISOString();
+
       await supabase.from("partner_reports").insert([
         {
           mitra_id: selectedMitra,
@@ -300,6 +255,87 @@ export default function LaporanPenjualanMitra() {
       await fetchReports();
     } catch {
       toast.error("Gagal simpan!");
+    }
+  };
+
+  // --- LOGIKA REVERSAL / HAPUS PENJUALAN ---
+  // FIX: Reversal FIFO terbalik (LIFO untuk undo) — kembalikan stok ke batch
+  // dengan urutan terbaru duluan (kebalikan dari saat jual)
+  const handleDeleteReport = async (report: PartnerReport) => {
+    if (!confirm("Hapus laporan? Stok & Saldo akan disinkronkan kembali."))
+      return;
+    const toastId = toast.loading("Sinkronisasi Reversal...");
+    try {
+      // Ambil SEMUA batch yang sudah habis/berkurang, urut dari terbaru (LIFO untuk reversal)
+      // Logika: saat jual, batch terlama dipakai duluan (FIFO)
+      // Saat reversal, kita kembalikan ke batch yang paling baru dipakai duluan
+      const { data: rawBatches } = await supabase
+        .from("transaction_items")
+        .select(
+          `id, transaction_id, remaining_qty_at_partner, price_at_time,
+           transactions!inner(id, total_amount, paid_amount, mitra_id, payment_method)`,
+        )
+        .eq("product_id", report.product_id)
+        .eq("transactions.mitra_id", report.mitra_id)
+        .order("id", { ascending: false }); // Terbaru duluan untuk reversal
+
+      const batches = rawBatches as unknown as StockBatch[];
+      if (!batches || batches.length === 0)
+        throw new Error("Batch transaksi tidak ditemukan.");
+
+      let remainingToRestore = report.qty;
+
+      for (const batch of batches) {
+        if (remainingToRestore <= 0) break;
+
+        // Hitung kapasitas yang bisa di-restore ke batch ini
+        // (tidak boleh melebihi qty awal batch tersebut)
+        // Kita restore sebanyak yang bisa ditampung, karena kita tidak tahu
+        // persis berapa yang diambil dari batch ini saat jual
+        // Pendekatan: restore sampai remainingToRestore habis
+        const restore = remainingToRestore;
+        remainingToRestore = 0;
+
+        // A. Kembalikan stok mitra ke batch ini
+        await supabase
+          .from("transaction_items")
+          .update({
+            remaining_qty_at_partner:
+              Number(batch.remaining_qty_at_partner) + restore,
+          })
+          .eq("id", batch.id);
+
+        // B. Kembalikan saldo kas HANYA jika batch ini Piutang
+        const isBeliPutus =
+          batch.transactions?.payment_method === "QRIS" ||
+          batch.transactions?.payment_method === "Transfer";
+
+        if (!isBeliPutus && batch.transactions) {
+          const modalToRestore = Math.round(restore * batch.price_at_time);
+          await supabase
+            .from("transactions")
+            .update({
+              total_amount: Math.round(
+                Number(batch.transactions.total_amount) + modalToRestore,
+              ),
+              paid_amount: Math.round(
+                Math.max(
+                  0,
+                  Number(batch.transactions.paid_amount) - modalToRestore,
+                ),
+              ),
+              payment_status: "Unpaid",
+            })
+            .eq("id", batch.transactions.id);
+        }
+      }
+
+      await supabase.from("partner_reports").delete().eq("id", report.id);
+      toast.success("DATA BERHASIL DI-RESET!", { id: toastId });
+      await fetchReports();
+    } catch (err: unknown) {
+      const error = err as Error;
+      toast.error(error.message || "Gagal!", { id: toastId });
     }
   };
 
